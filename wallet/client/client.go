@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Origami74/gonuts-tollgate/cashu"
 	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut01"
@@ -21,8 +24,56 @@ import (
 
 const maxResponseBytes = 1 << 20
 
+const (
+	maxRetries    = 4
+	baseBackoff   = 500 * time.Millisecond
+	maxBackoffDur = 30 * time.Second
+	jitterRange   = 250 * time.Millisecond
+)
+
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 func normalizeMintURL(mintURL string) string {
 	return strings.TrimRight(mintURL, "/")
+}
+
+type RateLimitError struct {
+	HTTPStatus   int
+	RetryAfterMs int
+	MintURL      string
+	Body         string
+}
+
+func (e *RateLimitError) Error() string {
+	if e.RetryAfterMs > 0 {
+		return fmt.Sprintf("mint %s rate limited (HTTP %d), retry after %dms", e.MintURL, e.HTTPStatus, e.RetryAfterMs)
+	}
+	return fmt.Sprintf("mint %s rate limited (HTTP %d)", e.MintURL, e.HTTPStatus)
+}
+
+func parseRetryAfter(resp *http.Response) int {
+	header := resp.Header.Get("Retry-After")
+	if header == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(header); err == nil && seconds >= 0 {
+		return seconds * 1000
+	}
+	return 0
+}
+
+func backoffDuration(attempt int, retryAfterMs int) time.Duration {
+	if retryAfterMs > 0 {
+		return time.Duration(retryAfterMs) * time.Millisecond
+	}
+	d := baseBackoff
+	for i := 0; i < attempt; i++ {
+		d *= 2
+		if d > maxBackoffDur {
+			d = maxBackoffDur
+		}
+	}
+	return d + time.Duration(rand.Int63n(int64(jitterRange)))
 }
 
 func GetMintInfo(mintURL string) (*nut06.MintInfo, error) {
@@ -331,18 +382,73 @@ func PostRestore(mintURL string, restoreRequest nut09.PostRestoreRequest) (
 }
 
 func get(url string) (*http.Response, error) {
-	resp, err := http.Get(url)
+	return getWithRetry(url, 0, 0)
+}
+
+func getWithRetry(url string, attempt int, retryAfterMs int) (*http.Response, error) {
+	resp, err := httpClient.Get(url)
 	if err != nil {
+		if attempt < maxRetries {
+			time.Sleep(backoffDuration(attempt, 0))
+			return getWithRetry(url, attempt+1, 0)
+		}
 		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if attempt < maxRetries {
+			ms := parseRetryAfter(resp)
+			resp.Body.Close()
+			time.Sleep(backoffDuration(attempt, ms))
+			return getWithRetry(url, attempt+1, ms)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, &RateLimitError{
+			HTTPStatus:   resp.StatusCode,
+			RetryAfterMs: retryAfterMs,
+			MintURL:      url,
+			Body:         string(body),
+		}
 	}
 
 	return parse(resp)
 }
 
 func httpPost(url, contentType string, body io.Reader) (*http.Response, error) {
-	resp, err := http.Post(url, contentType, body)
+	return httpPostWithRetry(url, contentType, body, 0, 0)
+}
+
+func httpPostWithRetry(url, contentType string, body io.Reader, attempt int, retryAfterMs int) (*http.Response, error) {
+	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+
+	resp, err := httpClient.Post(url, contentType, bytes.NewReader(bodyBytes))
+	if err != nil {
+		if attempt < maxRetries {
+			time.Sleep(backoffDuration(attempt, 0))
+			return httpPostWithRetry(url, contentType, bytes.NewReader(bodyBytes), attempt+1, 0)
+		}
 		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if attempt < maxRetries {
+			ms := parseRetryAfter(resp)
+			resp.Body.Close()
+			time.Sleep(backoffDuration(attempt, ms))
+			return httpPostWithRetry(url, contentType, bytes.NewReader(bodyBytes), attempt+1, ms)
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return nil, &RateLimitError{
+			HTTPStatus:   resp.StatusCode,
+			RetryAfterMs: retryAfterMs,
+			MintURL:      url,
+			Body:         string(respBody),
+		}
 	}
 
 	return parse(resp)

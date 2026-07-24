@@ -5,7 +5,10 @@ package wallet
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strconv"
@@ -257,5 +260,99 @@ func generateWalletKeyset(seed, derivationPath string, active bool, mintURL stri
 		Unit:       cashu.Sat.String(),
 		Active:     active,
 		PublicKeys: keys,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// resolveShortKeysetIds tests
+//
+// resolveShortKeysetIds resolves V4 short keyset IDs (8 bytes, 16 hex chars)
+// to full keyset IDs (33 bytes, 66 hex chars) per NUT-00 V4 spec.
+// Before gonuts v0.8.0, V4 tokens with V2 keysets failed at swap because
+// gonuts sent 8-byte short IDs to the mint, which rejected them with
+// "NUT02: ID length invalid".
+// ---------------------------------------------------------------------------
+
+const (
+	v2ShortID = "01df97b6fb8a572a"
+	v2FullID  = "01df97b6fb8a572a718d7df7fcbf4387e2d455134ea8004c9c8c51e1b3391f909e"
+	v1KeysetID = "009a1f293253e41e"
+)
+
+func testKeysetsHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprint(w, `{"keysets":[{"id":"`+v2FullID+`","unit":"sat","active":true}]}`)
+}
+
+func TestResolveShortKeysetIds_V1Passthrough(t *testing.T) {
+	proofs := cashu.Proofs{
+		{Id: v1KeysetID, Amount: 4, Secret: "s1", C: "02abc"},
+	}
+	resolved, err := resolveShortKeysetIds(proofs, "http://localhost:1/no-server-here")
+	if err != nil {
+		t.Fatalf("V1 passthrough should not error: %v", err)
+	}
+	if resolved[0].Id != v1KeysetID {
+		t.Errorf("V1 keyset changed: got %s, want %s", resolved[0].Id, v1KeysetID)
+	}
+}
+
+func TestResolveShortKeysetIds_V2ShortToFull(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(testKeysetsHandler))
+	defer server.Close()
+
+	proofs := cashu.Proofs{
+		{Id: v2ShortID, Amount: 4, Secret: "s1", C: "02abc"},
+	}
+	resolved, err := resolveShortKeysetIds(proofs, server.URL)
+	if err != nil {
+		t.Fatalf("V2 resolution failed: %v", err)
+	}
+	if resolved[0].Id != v2FullID {
+		t.Errorf("V2 keyset not resolved: got %s, want %s", resolved[0].Id, v2FullID)
+	}
+}
+
+func TestResolveShortKeysetIds_ShortIdNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"keysets":[{"id":"01aaaa1111bbbb22","unit":"sat","active":true}]}`)
+	}))
+	defer server.Close()
+
+	proofs := cashu.Proofs{
+		{Id: v2ShortID, Amount: 4, Secret: "s1", C: "02abc"},
+	}
+	_, err := resolveShortKeysetIds(proofs, server.URL)
+	if err == nil {
+		t.Fatal("expected error for unresolved short ID, got nil")
+	}
+}
+
+func TestResolveShortKeysetIds_MixedV1V2(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(testKeysetsHandler))
+	defer server.Close()
+
+	proofs := cashu.Proofs{
+		{Id: v1KeysetID, Amount: 2, Secret: "s1", C: "02a"},
+		{Id: v2ShortID, Amount: 4, Secret: "s2", C: "02b"},
+	}
+	resolved, err := resolveShortKeysetIds(proofs, server.URL)
+	if err != nil {
+		t.Fatalf("mixed resolution failed: %v", err)
+	}
+	if resolved[0].Id != v1KeysetID {
+		t.Errorf("V1 keyset changed: got %s, want %s", resolved[0].Id, v1KeysetID)
+	}
+	if resolved[1].Id != v2FullID {
+		t.Errorf("V2 keyset not resolved: got %s, want %s", resolved[1].Id, v2FullID)
+	}
+}
+
+func TestResolveShortKeysetIds_MintUnreachable(t *testing.T) {
+	proofs := cashu.Proofs{
+		{Id: v2ShortID, Amount: 4, Secret: "s1", C: "02abc"},
+	}
+	_, err := resolveShortKeysetIds(proofs, "http://localhost:1/no-server")
+	if err == nil {
+		t.Fatal("expected error for unreachable mint, got nil")
 	}
 }

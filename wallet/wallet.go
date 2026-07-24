@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -584,11 +585,60 @@ func (w *Wallet) HTLCLockedProofs(
 	return lockedProofs, nil
 }
 
+// resolveShortKeysetIds resolves V4 short keyset IDs (8 bytes, 16 hex chars)
+// to full keyset IDs per NUT-00 V4 spec. Short IDs are the first 8 bytes of
+// the full 33-byte V2 keyset ID. The mint only accepts full IDs in API calls.
+func resolveShortKeysetIds(proofs cashu.Proofs, mintURL string) (cashu.Proofs, error) {
+	needsResolution := false
+	for _, p := range proofs {
+		if len(p.Id) == 16 && strings.HasPrefix(p.Id, "01") {
+			needsResolution = true
+			break
+		}
+	}
+	if !needsResolution {
+		return proofs, nil
+	}
+
+	keysetsResp, err := client.GetAllKeysets(mintURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetching keysets from %s: %v", mintURL, err)
+	}
+
+	shortToFull := make(map[string]string)
+	for _, ks := range keysetsResp.Keysets {
+		if len(ks.Id) == 66 && strings.HasPrefix(ks.Id, "01") {
+			shortToFull[ks.Id[:16]] = ks.Id
+		}
+	}
+
+	resolved := make(cashu.Proofs, len(proofs))
+	copy(resolved, proofs)
+	for i := range resolved {
+		if len(resolved[i].Id) == 16 && strings.HasPrefix(resolved[i].Id, "01") {
+			full, ok := shortToFull[resolved[i].Id]
+			if !ok {
+				return nil, fmt.Errorf("short keyset ID %s not found in mint keysets", resolved[i].Id)
+			}
+			resolved[i].Id = full
+		}
+	}
+	return resolved, nil
+}
+
 // Receives Cashu token. If swap is true, it will swap the funds to the configured default mint.
 // If false, it will add the proofs from the mint and add that mint to the list of trusted mints.
 func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) {
 	proofsToSwap := token.Proofs()
 	tokenMint := token.Mint()
+
+	// NUT-00 V4 short keyset ID resolution: V4 tokens store keyset IDs as
+	// 8-byte short IDs. Wallets MUST resolve these to full IDs before
+	// processing (sending to mint swap/melt endpoints).
+	proofsToSwap, err := resolveShortKeysetIds(proofsToSwap, tokenMint)
+	if err != nil {
+		return 0, fmt.Errorf("could not resolve short keyset IDs: %v", err)
+	}
 
 	keyset, err := w.getActiveKeyset(tokenMint)
 	if err != nil {
