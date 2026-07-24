@@ -615,7 +615,7 @@ func resolveShortKeysetIds(proofs cashu.Proofs, mintURL string) (cashu.Proofs, e
 	resolved := make(cashu.Proofs, len(proofs))
 	copy(resolved, proofs)
 	for i := range resolved {
-		if len(resolved[i].Id) == 16 {
+		if len(resolved[i].Id) == 16 && strings.HasPrefix(resolved[i].Id, "01") {
 			full, ok := shortToFull[resolved[i].Id]
 			if !ok {
 				return nil, fmt.Errorf("short keyset ID %s not found in mint keysets", resolved[i].Id)
