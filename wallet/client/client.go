@@ -31,6 +31,8 @@ const (
 	jitterRange   = 250 * time.Millisecond
 )
 
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 func normalizeMintURL(mintURL string) string {
 	return strings.TrimRight(mintURL, "/")
 }
@@ -384,7 +386,7 @@ func get(url string) (*http.Response, error) {
 }
 
 func getWithRetry(url string, attempt int, retryAfterMs int) (*http.Response, error) {
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url)
 	if err != nil {
 		if attempt < maxRetries {
 			time.Sleep(backoffDuration(attempt, 0))
@@ -423,7 +425,7 @@ func httpPostWithRetry(url, contentType string, body io.Reader, attempt int, ret
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
 
-	resp, err := http.Post(url, contentType, bytes.NewReader(bodyBytes))
+	resp, err := httpClient.Post(url, contentType, bytes.NewReader(bodyBytes))
 	if err != nil {
 		if attempt < maxRetries {
 			time.Sleep(backoffDuration(attempt, 0))
