@@ -1405,7 +1405,11 @@ func (w *Wallet) selectProofsForAmount(
 		if inactiveKeysetProofs.Amount() < amount {
 			selectedProofs = inactiveKeysetProofs
 		} else {
-			selectedProofs, _ = selectProofsToSend(inactiveKeysetProofs, amount, mint, includeFees)
+			var err error
+			selectedProofs, err = selectProofsToSend(inactiveKeysetProofs, amount, mint, includeFees)
+			if err != nil {
+				selectedProofs = inactiveKeysetProofs
+			}
 		}
 		if includeFees {
 			fees = uint64(feesForProofs(selectedProofs, mint))
