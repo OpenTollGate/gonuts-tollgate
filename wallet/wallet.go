@@ -84,7 +84,7 @@ func LoadWallet(config Config) (*Wallet, error) {
 
 	db, err := InitStorage(path)
 	if err != nil {
-		return nil, fmt.Errorf("InitStorage: %v", err)
+		return nil, fmt.Errorf("InitStorage: %w", err)
 	}
 
 	isErr := true
@@ -100,12 +100,12 @@ func LoadWallet(config Config) (*Wallet, error) {
 		// create and save new seed if none existed previously
 		entropy, err := bip39.NewEntropy(128)
 		if err != nil {
-			return nil, fmt.Errorf("error generating seed: %v", err)
+			return nil, fmt.Errorf("error generating seed: %w", err)
 		}
 
 		mnemonic, err := bip39.NewMnemonic(entropy)
 		if err != nil {
-			return nil, fmt.Errorf("error generating seed: %v", err)
+			return nil, fmt.Errorf("error generating seed: %w", err)
 		}
 
 		seed = bip39.NewSeed(mnemonic, "")
@@ -130,7 +130,7 @@ func LoadWallet(config Config) (*Wallet, error) {
 	}
 	url, err := url.Parse(config.CurrentMintURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid mint url: %v", err)
+		return nil, fmt.Errorf("invalid mint url: %w", err)
 	}
 	mintURL := url.String()
 	wallet.defaultMint = mintURL
@@ -146,7 +146,7 @@ func LoadWallet(config Config) (*Wallet, error) {
 				fmt.Printf("Warning: %v\nContinuing in offline mode with existing mints only.\n\n", wrappedErr)
 				return wallet, nil
 			}
-			return nil, fmt.Errorf("error adding new mint: %v", err)
+			return nil, fmt.Errorf("error adding new mint: %w", err)
 		}
 	} else {
 		// if mint is known, check if active keyset has changed
@@ -174,7 +174,7 @@ func (w *Wallet) Shutdown() error {
 func (w *Wallet) AddMint(mint string) (*walletMint, error) {
 	url, err := url.Parse(mint)
 	if err != nil {
-		return nil, fmt.Errorf("invalid mint url: %v", err)
+		return nil, fmt.Errorf("invalid mint url: %w", err)
 	}
 	mintURL := url.String()
 
@@ -257,7 +257,7 @@ func (w *Wallet) RequestMint(amount uint64, mint string) (*nut04.PostMintQuoteBo
 
 	privateKey, err := secp256k1.GeneratePrivateKey()
 	if err != nil {
-		return nil, fmt.Errorf("could not create key for request: %v", err)
+		return nil, fmt.Errorf("could not create key for request: %w", err)
 	}
 
 	mintRequest := nut04.PostMintQuoteBolt11Request{
@@ -291,7 +291,7 @@ func (w *Wallet) RequestMint(amount uint64, mint string) (*nut04.PostMintQuoteBo
 		PrivateKey:     privateKey,
 	}
 	if err := w.db.SaveMintQuote(quote); err != nil {
-		return nil, fmt.Errorf("error saving mint quote: %v", err)
+		return nil, fmt.Errorf("error saving mint quote: %w", err)
 	}
 
 	return mintResponse, nil
@@ -334,7 +334,7 @@ func (w *Wallet) MintQuoteState(quoteId string) (*nut04.PostMintQuoteBolt11Respo
 	}
 
 	if err := w.db.SaveMintQuote(*quote); err != nil {
-		return nil, fmt.Errorf("error saving mint quote: %v", err)
+		return nil, fmt.Errorf("error saving mint quote: %w", err)
 	}
 
 	return mintQuote, nil
@@ -370,7 +370,7 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 
 	activeKeyset, err := w.getActiveKeyset(mint)
 	if err != nil {
-		return 0, fmt.Errorf("error getting active sat keyset: %v", err)
+		return 0, fmt.Errorf("error getting active sat keyset: %w", err)
 	}
 
 	w.mu.Lock()
@@ -381,14 +381,14 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 	split := w.splitWalletTarget(quote.Amount, mint)
 	blindedMessages, secrets, rs, err := w.createBlindedMessages(split, activeKeyset.Id, &counter)
 	if err != nil {
-		return 0, fmt.Errorf("error creating blinded messages: %v", err)
+		return 0, fmt.Errorf("error creating blinded messages: %w", err)
 	}
 
 	var signature string
 	if quote.PrivateKey != nil {
 		sig, err := nut20.SignMintQuote(quote.PrivateKey, quoteId, blindedMessages)
 		if err != nil {
-			return 0, fmt.Errorf("could not sign mint quote: %v", err)
+			return 0, fmt.Errorf("could not sign mint quote: %w", err)
 		}
 		signature = hex.EncodeToString(sig.Serialize())
 	}
@@ -407,17 +407,17 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 	// unblind the signatures from the promises and build the proofs
 	proofs, err := constructProofs(mintResponse.Signatures, blindedMessages, secrets, rs, activeKeyset)
 	if err != nil {
-		return 0, fmt.Errorf("error constructing proofs: %v", err)
+		return 0, fmt.Errorf("error constructing proofs: %w", err)
 	}
 
 	// store proofs in db
 	if err := w.db.SaveProofs(proofs); err != nil {
-		return 0, fmt.Errorf("error storing proofs: %v", err)
+		return 0, fmt.Errorf("error storing proofs: %w", err)
 	}
 
 	// only increase counter if mint was successful
 	if err := w.db.IncrementKeysetCounter(activeKeyset.Id, uint32(len(blindedMessages))); err != nil {
-		return 0, fmt.Errorf("error incrementing keyset counter: %v", err)
+		return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
 	}
 
 	quote.State = nut04.Issued
@@ -444,7 +444,7 @@ func (w *Wallet) Send(amount uint64, mintURL string, includeFees bool) (cashu.Pr
 	}
 
 	if err := w.db.AddPendingProofs(proofsToSend); err != nil {
-		return nil, fmt.Errorf("could not save proofs to pending: %v", err)
+		return nil, fmt.Errorf("could not save proofs to pending: %w", err)
 	}
 
 	return proofsToSend, nil
@@ -467,7 +467,7 @@ func (w *Wallet) SendWithOptions(amount uint64, mintURL string, options SendOpti
 	}
 
 	if err := w.db.AddPendingProofs(proofsToSend); err != nil {
-		return nil, fmt.Errorf("could not save proofs to pending: %v", err)
+		return nil, fmt.Errorf("could not save proofs to pending: %w", err)
 	}
 
 	actualAmount := proofsToSend.Amount()
@@ -506,7 +506,7 @@ func (w *Wallet) SendToPubkey(
 	// check first if mint supports P2PK NUT
 	mintInfo, err := client.GetMintInfo(mintURL)
 	if err != nil {
-		return nil, fmt.Errorf("error getting info from mint: %v", err)
+		return nil, fmt.Errorf("error getting info from mint: %w", err)
 	}
 	if !mintInfo.Nuts.Nut11.Supported {
 		return nil, errors.New("mint does not support Pay to Public Key")
@@ -552,7 +552,7 @@ func (w *Wallet) HTLCLockedProofs(
 	// check first if mint supports HTLC NUT
 	mintInfo, err := client.GetMintInfo(mintURL)
 	if err != nil {
-		return nil, fmt.Errorf("error getting info from mint: %v", err)
+		return nil, fmt.Errorf("error getting info from mint: %w", err)
 	}
 	if !mintInfo.Nuts.Nut14.Supported {
 		return nil, errors.New("mint does not support HTLCs")
@@ -560,7 +560,7 @@ func (w *Wallet) HTLCLockedProofs(
 
 	preimageBytes, err := hex.DecodeString(preimage)
 	if err != nil {
-		return nil, fmt.Errorf("invalid preimage: %v", err)
+		return nil, fmt.Errorf("invalid preimage: %w", err)
 	}
 	hashBytes := sha256.Sum256(preimageBytes)
 	hash := hex.EncodeToString(hashBytes[:])
@@ -602,7 +602,7 @@ func resolveShortKeysetIds(proofs cashu.Proofs, mintURL string) (cashu.Proofs, e
 
 	keysetsResp, err := client.GetAllKeysets(mintURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetching keysets from %s: %v", mintURL, err)
+		return nil, fmt.Errorf("fetching keysets from %s: %w", mintURL, err)
 	}
 
 	shortToFull := make(map[string]string)
@@ -637,12 +637,12 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 	// processing (sending to mint swap/melt endpoints).
 	proofsToSwap, err := resolveShortKeysetIds(proofsToSwap, tokenMint)
 	if err != nil {
-		return 0, fmt.Errorf("could not resolve short keyset IDs: %v", err)
+		return 0, fmt.Errorf("could not resolve short keyset IDs: %w", err)
 	}
 
 	keyset, err := w.getActiveKeyset(tokenMint)
 	if err != nil {
-		return 0, fmt.Errorf("could not get active keyset: %v", err)
+		return 0, fmt.Errorf("could not get active keyset: %w", err)
 	}
 
 	// verify DLEQ in proofs if present, using the correct keyset per proof.Id
@@ -666,7 +666,7 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 		}
 		proofsToSwap, err = nut11.AddSignatureToInputs(proofsToSwap, w.privateKey)
 		if err != nil {
-			return 0, fmt.Errorf("error signing inputs: %v", err)
+			return 0, fmt.Errorf("error signing inputs: %w", err)
 		}
 	}
 
@@ -699,14 +699,14 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 
 		req, err := w.createSwapRequest(proofsToSwap, &mint)
 		if err != nil {
-			return 0, fmt.Errorf("could not create swap request: %v", err)
+			return 0, fmt.Errorf("could not create swap request: %w", err)
 		}
 
 		//if P2PK locked ecash has `SIG_ALL` flag, sign outputs
 		if nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
 			req.outputs, err = nut11.AddSignatureToOutputs(req.outputs, w.privateKey)
 			if err != nil {
-				return 0, fmt.Errorf("error signing outputs: %v", err)
+				return 0, fmt.Errorf("error signing outputs: %w", err)
 			}
 		}
 
@@ -714,7 +714,7 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 		defer w.mu.Unlock()
 
 		if err = w.db.IncrementKeysetCounter(req.keyset.Id, uint32(len(req.outputs))); err != nil {
-			return 0, fmt.Errorf("error incrementing keyset counter: %v", err)
+			return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
 		}
 
 		newProofs, err := w.swapWithRetry(tokenMint, req, proofsToSwap, &mint, nut10Secret)
@@ -723,7 +723,7 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 		}
 
 		if err := w.db.SaveProofs(newProofs); err != nil {
-			return 0, fmt.Errorf("error storing proofs: %v", err)
+			return 0, fmt.Errorf("error storing proofs: %w", err)
 		}
 		return newProofs.Amount(), nil
 	}
@@ -738,7 +738,7 @@ func (w *Wallet) ReceiveHTLC(token cashu.Token, preimage string) (uint64, error)
 
 	keyset, err := w.getActiveKeyset(tokenMint)
 	if err != nil {
-		return 0, fmt.Errorf("could not get active keyset: %v", err)
+		return 0, fmt.Errorf("could not get active keyset: %w", err)
 	}
 	// verify DLEQ in proofs if present, using the correct keyset per proof.Id
 	valid, dleqErr := nut12.VerifyProofsDLEQWithKeysets(proofs, *keyset, func(keysetID string) (crypto.PublicKeys, error) {
@@ -760,7 +760,7 @@ func (w *Wallet) ReceiveHTLC(token cashu.Token, preimage string) (uint64, error)
 	if err == nil && nut10Secret.Kind == nut10.HTLC {
 		proofs, err = nut14.AddWitnessHTLC(proofs, nut10Secret, preimage, w.privateKey)
 		if err != nil {
-			return 0, fmt.Errorf("could not add HTLC witness: %v", err)
+			return 0, fmt.Errorf("could not add HTLC witness: %w", err)
 		}
 
 		// only add mint if not previously trusted
@@ -775,20 +775,20 @@ func (w *Wallet) ReceiveHTLC(token cashu.Token, preimage string) (uint64, error)
 
 		req, err := w.createSwapRequest(proofs, &mint)
 		if err != nil {
-			return 0, fmt.Errorf("could not create swap request: %v", err)
+			return 0, fmt.Errorf("could not create swap request: %w", err)
 		}
 
 		//if `SIG_ALL` flag, sign outputs
 		if nut11.IsSigAll(nut10Secret) {
 			req.outputs, err = nut14.AddWitnessHTLCToOutputs(req.outputs, preimage, w.privateKey)
 			if err != nil {
-				return 0, fmt.Errorf("could not add HTLC witness to outputs: %v", err)
+				return 0, fmt.Errorf("could not add HTLC witness to outputs: %w", err)
 			}
 		}
 
 		err = w.db.IncrementKeysetCounter(req.keyset.Id, uint32(len(req.outputs)))
 		if err != nil {
-			return 0, fmt.Errorf("error incrementing keyset counter: %v", err)
+			return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
 		}
 
 		newProofs, err := w.swapWithRetry(tokenMint, req, proofs, &mint, nut10Secret)
@@ -797,7 +797,7 @@ func (w *Wallet) ReceiveHTLC(token cashu.Token, preimage string) (uint64, error)
 		}
 
 		if err := w.db.SaveProofs(newProofs); err != nil {
-			return 0, fmt.Errorf("error storing proofs: %v", err)
+			return 0, fmt.Errorf("error storing proofs: %w", err)
 		}
 		return newProofs.Amount(), nil
 	}
@@ -821,7 +821,7 @@ func (w *Wallet) createSwapRequest(proofs cashu.Proofs, mint *walletMint) (swapR
 	split := w.splitWalletTarget(proofs.Amount()-uint64(fees), mint.mintURL)
 	outputs, secrets, rs, err := w.createBlindedMessages(split, mint.activeKeyset.Id, &keysetCounter)
 	if err != nil {
-		return swapRequestPayload{}, fmt.Errorf("createBlindedMessages: %v", err)
+		return swapRequestPayload{}, fmt.Errorf("createBlindedMessages: %w", err)
 	}
 
 	return swapRequestPayload{
@@ -853,7 +853,7 @@ var swap = func(mint string, swapRequest swapRequestPayload) (cashu.Proofs, erro
 		swapRequest.keyset,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("wallet.ConstructProofs: %v", err)
+		return nil, fmt.Errorf("wallet.ConstructProofs: %w", err)
 	}
 
 	return proofs, nil
@@ -901,11 +901,11 @@ func (w *Wallet) swapToTrusted(proofs cashu.Proofs, mint *walletMint) (uint64, e
 	if err == nil && nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
 		req, err := w.createSwapRequest(proofs, mint)
 		if err != nil {
-			return 0, fmt.Errorf("could not create swap request: %v", err)
+			return 0, fmt.Errorf("could not create swap request: %w", err)
 		}
 		req.outputs, err = nut11.AddSignatureToOutputs(req.outputs, w.privateKey)
 		if err != nil {
-			return 0, fmt.Errorf("error signing outputs: %v", err)
+			return 0, fmt.Errorf("error signing outputs: %w", err)
 		}
 
 		newProofs, err := swap(mint.mintURL, req)
@@ -933,7 +933,7 @@ func (w *Wallet) RequestMeltQuote(request, mint string) (*nut05.PostMeltQuoteBol
 
 	_, err := decodepay.Decodepay(request)
 	if err != nil {
-		return nil, fmt.Errorf("invalid invoice: %v", err)
+		return nil, fmt.Errorf("invalid invoice: %w", err)
 	}
 
 	meltRequest := nut05.PostMeltQuoteBolt11Request{Request: request, Unit: w.unit.String()}
@@ -955,7 +955,7 @@ func (w *Wallet) RequestMeltQuote(request, mint string) (*nut05.PostMeltQuoteBol
 		QuoteExpiry:    meltQuoteResponse.Expiry,
 	}
 	if err := w.db.SaveMeltQuote(quote); err != nil {
-		return nil, fmt.Errorf("error saving melt quote: %v", err)
+		return nil, fmt.Errorf("error saving melt quote: %w", err)
 	}
 
 	return meltQuoteResponse, nil
@@ -987,13 +987,13 @@ func (w *Wallet) CheckMeltQuoteState(quoteId string) (*nut05.PostMeltQuoteBolt11
 				keysetId = pendingProofs[0].Id
 			}
 			if err := w.db.DeletePendingProofsByQuoteId(quoteId); err != nil {
-				return nil, fmt.Errorf("error removing pending proofs: %v", err)
+				return nil, fmt.Errorf("error removing pending proofs: %w", err)
 			}
 			change := len(quoteStateResponse.Change)
 			// increment the counter if there was change from this quote
 			if change > 0 {
 				if err := w.db.IncrementKeysetCounter(keysetId, uint32(change)); err != nil {
-					return nil, fmt.Errorf("error incrementing keyset counter: %v", err)
+					return nil, fmt.Errorf("error incrementing keyset counter: %w", err)
 				}
 			}
 		} else if quoteStateResponse.State == nut05.Unpaid {
@@ -1015,10 +1015,10 @@ func (w *Wallet) CheckMeltQuoteState(quoteId string) (*nut05.PostMeltQuoteBolt11
 				}
 
 				if err := w.db.DeletePendingProofsByQuoteId(quoteId); err != nil {
-					return nil, fmt.Errorf("error removing pending proofs: %v", err)
+					return nil, fmt.Errorf("error removing pending proofs: %w", err)
 				}
 				if err := w.db.SaveProofs(proofsToSave); err != nil {
-					return nil, fmt.Errorf("error storing proofs: %v", err)
+					return nil, fmt.Errorf("error storing proofs: %w", err)
 				}
 			}
 
@@ -1046,7 +1046,7 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		// if quote was previously pending, check if state has changed
 		meltState, err := w.CheckMeltQuoteState(quoteId)
 		if err != nil {
-			return nil, fmt.Errorf("error checking state of quote: %v", err)
+			return nil, fmt.Errorf("error checking state of quote: %w", err)
 		}
 
 		if meltState.State == nut05.Pending {
@@ -1066,12 +1066,12 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 
 	// set proofs to pending
 	if err := w.db.AddPendingProofsByQuoteId(proofs, quote.QuoteId); err != nil {
-		return nil, fmt.Errorf("error saving pending proofs: %v", err)
+		return nil, fmt.Errorf("error saving pending proofs: %w", err)
 	}
 
 	activeKeyset, err := w.getActiveKeyset(mint.mintURL)
 	if err != nil {
-		return nil, fmt.Errorf("error getting active sat keyset: %v", err)
+		return nil, fmt.Errorf("error getting active sat keyset: %w", err)
 	}
 	counter := w.counterForKeyset(activeKeyset.Id)
 
@@ -1080,7 +1080,7 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 	split := make([]uint64, numBlankOutputs)
 	outputs, outputsSecrets, outputsRs, err := w.createBlindedMessages(split, activeKeyset.Id, &counter)
 	if err != nil {
-		return nil, fmt.Errorf("error generating blinded messages for change: %v", err)
+		return nil, fmt.Errorf("error generating blinded messages for change: %w", err)
 	}
 
 	meltBolt11Request := nut05.PostMeltBolt11Request{
@@ -1094,15 +1094,15 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 			// only remove proofs from pending and save them for use
 			// if got specific error that payment failed
 			if err := w.db.SaveProofs(proofs); err != nil {
-				return nil, fmt.Errorf("error storing proofs: %v", err)
+				return nil, fmt.Errorf("error storing proofs: %w", err)
 			}
 			if err := w.db.DeletePendingProofsByQuoteId(quote.QuoteId); err != nil {
-				return nil, fmt.Errorf("error removing pending proofs: %v", err)
+				return nil, fmt.Errorf("error removing pending proofs: %w", err)
 			}
 			return nil, err
 		} else {
 			// for any other errors leave proofs as pending
-			return nil, fmt.Errorf("error doing melt request: %v. Proofs are pending", err)
+			return nil, fmt.Errorf("error doing melt request: %w. Proofs are pending", err)
 		}
 	}
 
@@ -1111,21 +1111,21 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		// if quote is unpaid, remove proofs from pending and add them
 		// to proofs available
 		if err := w.db.SaveProofs(proofs); err != nil {
-			return nil, fmt.Errorf("error storing proofs: %v", err)
+			return nil, fmt.Errorf("error storing proofs: %w", err)
 		}
 		if err := w.db.DeletePendingProofsByQuoteId(quote.QuoteId); err != nil {
-			return nil, fmt.Errorf("error removing pending proofs: %v", err)
+			return nil, fmt.Errorf("error removing pending proofs: %w", err)
 		}
 	case nut05.Pending:
 		quote.State = nut05.Pending
 		if err := w.db.SaveMeltQuote(*quote); err != nil {
-			return nil, fmt.Errorf("error updating melt quote: %v", err)
+			return nil, fmt.Errorf("error updating melt quote: %w", err)
 		}
 
 	case nut05.Paid:
 		// payment succeeded so remove proofs from pending
 		if err := w.db.DeletePendingProofsByQuoteId(quote.QuoteId); err != nil {
-			return nil, fmt.Errorf("error removing pending proofs: %v", err)
+			return nil, fmt.Errorf("error removing pending proofs: %w", err)
 		}
 
 		quote.Preimage = meltBolt11Response.Preimage
@@ -1148,13 +1148,13 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 				activeKeyset,
 			)
 			if err != nil {
-				return nil, fmt.Errorf("error unblinding signature from change: %v", err)
+				return nil, fmt.Errorf("error unblinding signature from change: %w", err)
 			}
 			if err := w.db.SaveProofs(changeProofs); err != nil {
-				return nil, fmt.Errorf("error storing change proofs: %v", err)
+				return nil, fmt.Errorf("error storing change proofs: %w", err)
 			}
 			if err := w.db.IncrementKeysetCounter(activeKeyset.Id, uint32(change)); err != nil {
-				return nil, fmt.Errorf("error incrementing keyset counter: %v", err)
+				return nil, fmt.Errorf("error incrementing keyset counter: %w", err)
 			}
 		}
 	}
@@ -1171,7 +1171,7 @@ func (w *Wallet) MultiMintPayment(request string, split map[string]uint64) ([]nu
 
 	bolt11, err := decodepay.Decodepay(request)
 	if err != nil {
-		return nil, fmt.Errorf("invalid invoice: %v", err)
+		return nil, fmt.Errorf("invalid invoice: %w", err)
 	}
 
 	balanceByMint := w.GetBalanceByMints()
@@ -1244,7 +1244,7 @@ func (w *Wallet) MultiMintPayment(request string, split map[string]uint64) ([]nu
 					QuoteExpiry:    meltQuoteResponse.Expiry,
 				}
 				if err := w.db.SaveMeltQuote(quote); err != nil {
-					results[j] = result{response: nil, err: fmt.Errorf("unable to save melt quote: %v", err)}
+					results[j] = result{response: nil, err: fmt.Errorf("unable to save melt quote: %w", err)}
 					return
 				}
 				results[j] = result{response: meltQuoteResponse, err: nil}
@@ -1328,7 +1328,7 @@ func (w *Wallet) swapProofs(proofs cashu.Proofs, from, to *walletMint) (uint64, 
 		var err error
 		mintResponse, err = w.RequestMint(mintAmountRequest, to.mintURL)
 		if err != nil {
-			return 0, fmt.Errorf("error requesting mint quote: %v", err)
+			return 0, fmt.Errorf("error requesting mint quote: %w", err)
 		}
 
 		// request melt quote from the 'from' mint
@@ -1336,7 +1336,7 @@ func (w *Wallet) swapProofs(proofs cashu.Proofs, from, to *walletMint) (uint64, 
 		meltRequest := nut05.PostMeltQuoteBolt11Request{Request: mintResponse.Request, Unit: cashu.Sat.String()}
 		meltQuoteResponse, err = client.PostMeltQuoteBolt11(from.mintURL, meltRequest)
 		if err != nil {
-			return 0, fmt.Errorf("error with melt request: %v", err)
+			return 0, fmt.Errorf("error with melt request: %w", err)
 		}
 
 		// if amount in proofs is less than amount asked from mint in melt request,
@@ -1353,7 +1353,7 @@ func (w *Wallet) swapProofs(proofs cashu.Proofs, from, to *walletMint) (uint64, 
 	meltBolt11Request := nut05.PostMeltBolt11Request{Quote: meltQuoteResponse.Quote, Inputs: proofs}
 	meltBolt11Response, err := client.PostMeltBolt11(from.mintURL, meltBolt11Request)
 	if err != nil {
-		return 0, fmt.Errorf("error melting token: %v", err)
+		return 0, fmt.Errorf("error melting token: %w", err)
 	}
 
 	// if melt request was successful and invoice got paid,
@@ -1361,7 +1361,7 @@ func (w *Wallet) swapProofs(proofs cashu.Proofs, from, to *walletMint) (uint64, 
 	if meltBolt11Response.State == nut05.Paid {
 		mintedAmount, err := w.MintTokens(mintResponse.Quote)
 		if err != nil {
-			return 0, fmt.Errorf("error minting tokens: %v", err)
+			return 0, fmt.Errorf("error minting tokens: %w", err)
 		}
 		return mintedAmount, nil
 	} else {
@@ -1531,7 +1531,7 @@ func (w *Wallet) swapToSend(
 ) (cashu.Proofs, error) {
 	activeSatKeyset, err := w.getActiveKeyset(mint.mintURL)
 	if err != nil {
-		return nil, fmt.Errorf("error getting active sat keyset: %v", err)
+		return nil, fmt.Errorf("error getting active sat keyset: %w", err)
 	}
 
 	splitForSendAmount := cashu.AmountSplit(amount)
@@ -1600,7 +1600,7 @@ func (w *Wallet) swapToSend(
 
 	proofsFromSwap, err := constructProofs(swapResponse.Signatures, blindedMessages, secrets, rs, activeSatKeyset)
 	if err != nil {
-		return nil, fmt.Errorf("wallet.ConstructProofs: %v", err)
+		return nil, fmt.Errorf("wallet.ConstructProofs: %w", err)
 	}
 
 	for _, proof := range proofsToSwap {
@@ -1620,12 +1620,12 @@ func (w *Wallet) swapToSend(
 
 	// remaining proofs are change proofs to save to db
 	if err := w.db.SaveProofs(proofsFromSwap); err != nil {
-		return nil, fmt.Errorf("error storing proofs: %v", err)
+		return nil, fmt.Errorf("error storing proofs: %w", err)
 	}
 
 	err = w.db.IncrementKeysetCounter(activeSatKeyset.Id, incrementCounterBy)
 	if err != nil {
-		return nil, fmt.Errorf("error incrementing keyset counter: %v", err)
+		return nil, fmt.Errorf("error incrementing keyset counter: %w", err)
 	}
 
 	return proofsToSend, nil
@@ -2092,7 +2092,7 @@ func (w *Wallet) UpdateMintURL(oldURL, newURL string) error {
 	}
 
 	if err := w.db.UpdateKeysetMintURL(oldURL, newURL); err != nil {
-		return fmt.Errorf("error updating mint URL in database: %v", err)
+		return fmt.Errorf("error updating mint URL in database: %w", err)
 	}
 
 	mint.mintURL = newURL
@@ -2171,7 +2171,7 @@ func (w *Wallet) RemoveSpentProofs() error {
 		}
 
 		if err := w.db.DeletePendingProofs(YsToDelete); err != nil {
-			return fmt.Errorf("error removing pending proofs: %v", err)
+			return fmt.Errorf("error removing pending proofs: %w", err)
 		}
 	}
 
@@ -2220,21 +2220,21 @@ func (w *Wallet) ReclaimUnspentProofs() (uint64, error) {
 			mint := w.mints[mintURL]
 			req, err := w.createSwapRequest(proofsToReclaim, &mint)
 			if err != nil {
-				return 0, fmt.Errorf("could not create swap request: %v", err)
+				return 0, fmt.Errorf("could not create swap request: %w", err)
 			}
 			err = w.db.IncrementKeysetCounter(req.keyset.Id, uint32(len(req.outputs)))
 			if err != nil {
-				return 0, fmt.Errorf("error incrementing keyset counter: %v", err)
+				return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
 			}
 			newProofs, err := swap(mintURL, req)
 			if err != nil {
 				return 0, fmt.Errorf("could not swap proofs: %w", err)
 			}
 			if err := w.db.SaveProofs(newProofs); err != nil {
-				return 0, fmt.Errorf("error storing proofs: %v", err)
+				return 0, fmt.Errorf("error storing proofs: %w", err)
 			}
 			if err := w.db.DeletePendingProofs(pendingYsToDelete); err != nil {
-				return 0, fmt.Errorf("error removing pending proofs: %v", err)
+				return 0, fmt.Errorf("error removing pending proofs: %w", err)
 			}
 
 			amountReclaimed = newProofs.Amount()
@@ -2272,7 +2272,7 @@ func (w *Wallet) GetMintQuoteById(id string) *storage.MintQuote {
 func (w *Wallet) GetMintQuoteByPaymentRequest(request string) (*storage.MintQuote, error) {
 	_, err := decodepay.Decodepay(request)
 	if err != nil {
-		return nil, fmt.Errorf("invalid payment request: %v", err)
+		return nil, fmt.Errorf("invalid payment request: %w", err)
 	}
 
 	quotes := w.db.GetMintQuotes()
