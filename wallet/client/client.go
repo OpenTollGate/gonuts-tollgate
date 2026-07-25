@@ -51,6 +51,20 @@ func (e *RateLimitError) Error() string {
 	return fmt.Sprintf("mint %s rate limited (HTTP %d)", e.MintURL, e.HTTPStatus)
 }
 
+type ServerError struct {
+	HTTPStatus int
+	MintURL    string
+	Body       string
+}
+
+func (e *ServerError) Error() string {
+	return fmt.Sprintf("mint %s returned server error (HTTP %d): %s", e.MintURL, e.HTTPStatus, e.Body)
+}
+
+func isRetriable(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || statusCode >= 500
+}
+
 func parseRetryAfter(resp *http.Response) int {
 	header := resp.Header.Get("Retry-After")
 	if header == "" {
@@ -395,20 +409,27 @@ func getWithRetry(url string, attempt int, retryAfterMs int) (*http.Response, er
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusTooManyRequests {
+	if isRetriable(resp.StatusCode) {
 		if attempt < maxRetries {
 			ms := parseRetryAfter(resp)
 			resp.Body.Close()
 			time.Sleep(backoffDuration(attempt, ms))
 			return getWithRetry(url, attempt+1, ms)
 		}
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		resp.Body.Close()
-		return nil, &RateLimitError{
-			HTTPStatus:   resp.StatusCode,
-			RetryAfterMs: retryAfterMs,
-			MintURL:      url,
-			Body:         string(body),
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, &RateLimitError{
+				HTTPStatus:   resp.StatusCode,
+				RetryAfterMs: retryAfterMs,
+				MintURL:      url,
+				Body:         string(body),
+			}
+		}
+		return nil, &ServerError{
+			HTTPStatus: resp.StatusCode,
+			MintURL:    url,
+			Body:       string(body),
 		}
 	}
 
@@ -441,13 +462,23 @@ func httpPostWithRetry(url, contentType string, body io.Reader, attempt int, ret
 			time.Sleep(backoffDuration(attempt, ms))
 			return httpPostWithRetry(url, contentType, bytes.NewReader(bodyBytes), attempt+1, ms)
 		}
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		resp.Body.Close()
 		return nil, &RateLimitError{
 			HTTPStatus:   resp.StatusCode,
 			RetryAfterMs: retryAfterMs,
 			MintURL:      url,
 			Body:         string(respBody),
+		}
+	}
+
+	if resp.StatusCode >= 500 {
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+		resp.Body.Close()
+		return nil, &ServerError{
+			HTTPStatus: resp.StatusCode,
+			MintURL:    url,
+			Body:       string(respBody),
 		}
 	}
 
