@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -352,5 +353,87 @@ func TestPostWithRetry_On429(t *testing.T) {
 	}
 	if atomic.LoadInt32(&attempts) != 2 {
 		t.Errorf("expected 2 attempts, got %d", attempts)
+	}
+}
+
+func TestGetWithRetry_On500(t *testing.T) {
+	var attempts int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&attempts, 1)
+		if current < 3 {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error":"internal server error"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"keysets":[]}`))
+	}))
+	defer server.Close()
+
+	resp, err := get(server.URL + "/v1/keysets")
+	if err != nil {
+		t.Fatalf("expected success after retry, got: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 after retry, got %d", resp.StatusCode)
+	}
+	if atomic.LoadInt32(&attempts) != 3 {
+		t.Errorf("expected 3 attempts, got %d", attempts)
+	}
+}
+
+func TestGetWithRetry_On503ExceedsMaxRetries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"overloaded"}`))
+	}))
+	defer server.Close()
+
+	_, err := get(server.URL + "/v1/keysets")
+	if err == nil {
+		t.Fatal("expected error after exhausting retries on 503")
+	}
+	var serverErr *ServerError
+	if !errors.As(err, &serverErr) {
+		t.Errorf("expected *ServerError, got %T: %v", err, err)
+	}
+	if serverErr.HTTPStatus != http.StatusServiceUnavailable {
+		t.Errorf("expected status 503, got %d", serverErr.HTTPStatus)
+	}
+}
+
+func TestPostWithRetry_502ReturnsServerError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		w.Write([]byte(`{"error":"bad gateway"}`))
+	}))
+	defer server.Close()
+
+	swapReq := nut03.PostSwapRequest{
+		Inputs:  cashu.Proofs{},
+		Outputs: cashu.BlindedMessages{},
+	}
+	_, err := PostSwap(server.URL, swapReq)
+	if err == nil {
+		t.Fatal("expected ServerError for 502 POST")
+	}
+	var serverErr *ServerError
+	if !errors.As(err, &serverErr) {
+		t.Errorf("expected *ServerError, got %T: %v", err, err)
+	}
+	if serverErr.HTTPStatus != http.StatusBadGateway {
+		t.Errorf("expected status 502, got %d", serverErr.HTTPStatus)
+	}
+}
+
+func TestServerError_Error(t *testing.T) {
+	e := &ServerError{HTTPStatus: 500, MintURL: "https://mint.example.com", Body: "internal error"}
+	if !strings.Contains(e.Error(), "500") {
+		t.Errorf("error should contain status code: %s", e.Error())
+	}
+	if !strings.Contains(e.Error(), "mint.example.com") {
+		t.Errorf("error should contain mint URL: %s", e.Error())
 	}
 }
