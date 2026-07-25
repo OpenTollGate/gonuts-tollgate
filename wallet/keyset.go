@@ -69,6 +69,10 @@ func GetKeysetKeys(mintURL, id string) (crypto.PublicKeys, error) {
 		return nil, fmt.Errorf("error getting keyset from mint: %w", err)
 	}
 
+	if len(keysetsResponse.Keysets) == 0 {
+		return nil, fmt.Errorf("mint returned no keysets for id %s", id)
+	}
+
 	keyset := keysetsResponse.Keysets[0]
 
 	var derivedId string

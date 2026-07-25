@@ -753,6 +753,9 @@ func (w *Wallet) ReceiveHTLC(token cashu.Token, preimage string) (uint64, error)
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if len(proofs) == 0 {
+		return 0, errors.New("no proofs in token")
+	}
 	nut10Secret, err := nut10.DeserializeSecret(proofs[0].Secret)
 	if err == nil && nut10Secret.Kind == nut10.HTLC {
 		proofs, err = nut14.AddWitnessHTLC(proofs, nut10Secret, preimage, w.privateKey)
@@ -889,9 +892,11 @@ func (w *Wallet) swapWithRetry(
 // swapToTrusted will swap the proofs from mint
 // to the wallet's configured default mint
 func (w *Wallet) swapToTrusted(proofs cashu.Proofs, mint *walletMint) (uint64, error) {
+	if len(proofs) == 0 {
+		return 0, errors.New("no proofs to swap")
+	}
 	proofsToSwap := proofs
 
-	// if proofs are P2PK locked and sig all, add signatures to swap them first and then melt
 	nut10Secret, err := nut10.DeserializeSecret(proofs[0].Secret)
 	if err == nil && nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
 		req, err := w.createSwapRequest(proofs, mint)
