@@ -212,6 +212,9 @@ func NewTokenV3(proofs Proofs, mint string, unit Unit, includeDLEQ bool) (TokenV
 }
 
 func DecodeTokenV3(tokenstr string) (*TokenV3, error) {
+	if len(tokenstr) < 6 {
+		return nil, ErrInvalidTokenV3
+	}
 	prefixVersion := tokenstr[:6]
 	base64Token := tokenstr[6:]
 
@@ -396,6 +399,9 @@ func NewTokenV4(proofs Proofs, mint string, unit Unit, includeDLEQ bool) (TokenV
 }
 
 func DecodeTokenV4(tokenstr string) (*TokenV4, error) {
+	if len(tokenstr) < 6 {
+		return nil, ErrInvalidTokenV4
+	}
 	prefixVersion := tokenstr[:6]
 	base64Token := tokenstr[6:]
 	if prefixVersion != "cashuB" {
