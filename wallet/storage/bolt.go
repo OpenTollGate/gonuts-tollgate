@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut04"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut05"
-	"github.com/Origami74/gonuts-tollgate/crypto"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
+	"github.com/OpenTollGate/gonuts-tollgate/crypto"
 	bolt "go.etcd.io/bbolt"
 )
 

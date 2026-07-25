@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut04"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut07"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut17"
-	"github.com/Origami74/gonuts-tollgate/mint/pubsub"
-	"github.com/Origami74/gonuts-tollgate/mint/storage"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut07"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut17"
+	"github.com/OpenTollGate/gonuts-tollgate/mint/pubsub"
+	"github.com/OpenTollGate/gonuts-tollgate/mint/storage"
 	"github.com/gorilla/websocket"
 )
 

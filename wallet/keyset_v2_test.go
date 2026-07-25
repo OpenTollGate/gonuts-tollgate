@@ -5,8 +5,8 @@ package wallet
 import (
 	"testing"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/wallet/client"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/wallet/client"
 )
 
 func TestGetKeysetKeys_V2_testnut_cashu_space(t *testing.T) {

@@ -6,7 +6,7 @@ package nut01
 import (
 	"encoding/json"
 
-	"github.com/Origami74/gonuts-tollgate/crypto"
+	"github.com/OpenTollGate/gonuts-tollgate/crypto"
 )
 
 type GetKeysResponse struct {

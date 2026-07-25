@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Origami74/gonuts-tollgate/mint/lightning"
+	"github.com/OpenTollGate/gonuts-tollgate/mint/lightning"
 )
 
 func TestKeysetRotations(t *testing.T) {

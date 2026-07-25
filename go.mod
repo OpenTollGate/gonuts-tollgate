@@ -1,4 +1,4 @@
-module github.com/Origami74/gonuts-tollgate
+module github.com/OpenTollGate/gonuts-tollgate
 
 go 1.24.2
 

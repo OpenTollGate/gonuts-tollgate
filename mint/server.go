@@ -16,13 +16,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut01"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut03"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut04"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut05"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut07"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut09"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut01"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut03"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut07"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut09"
 	"github.com/gorilla/mux"
 )
 

@@ -3,8 +3,8 @@ package mint
 import (
 	"time"
 
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut06"
-	"github.com/Origami74/gonuts-tollgate/mint/lightning"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut06"
+	"github.com/OpenTollGate/gonuts-tollgate/mint/lightning"
 )
 
 type LogLevel int
