@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/mint"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/mint"
 )
 
 const (

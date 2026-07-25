@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut10"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut10"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 )

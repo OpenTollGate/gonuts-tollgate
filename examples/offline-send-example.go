@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/wallet"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/wallet"
 )
 
 func main() {

@@ -6,7 +6,7 @@ package nut05
 import (
 	"encoding/json"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 )
 
 type State int

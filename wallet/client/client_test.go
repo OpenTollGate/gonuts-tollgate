@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut03"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut03"
 )
 
 func TestNormalizeMintURL(t *testing.T) {

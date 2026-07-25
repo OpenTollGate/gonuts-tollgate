@@ -10,8 +10,8 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut02"
-	"github.com/Origami74/gonuts-tollgate/mint/manager"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut02"
+	"github.com/OpenTollGate/gonuts-tollgate/mint/manager"
 	"github.com/urfave/cli/v2"
 )
 

@@ -5,8 +5,8 @@ package wallet
 import (
 	"testing"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/wallet/client"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/wallet/client"
 )
 
 // This test demonstrates the V1/V2 keyset ID incompatibility.

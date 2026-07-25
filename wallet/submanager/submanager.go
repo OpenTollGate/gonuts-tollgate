@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Origami74/gonuts-tollgate/cashu"
-	"github.com/Origami74/gonuts-tollgate/cashu/nuts/nut17"
-	"github.com/Origami74/gonuts-tollgate/wallet/client"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut17"
+	"github.com/OpenTollGate/gonuts-tollgate/wallet/client"
 	"github.com/gorilla/websocket"
 )
 
