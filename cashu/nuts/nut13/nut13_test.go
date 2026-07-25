@@ -2,6 +2,7 @@ package nut13
 
 import (
 	"encoding/hex"
+	"math/big"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
@@ -71,4 +72,78 @@ func TestSecretDerivation(t *testing.T) {
 		}
 	}
 
+}
+
+func TestDeriveKeysetPath_V2KeyId(t *testing.T) {
+	mnemonic := "half depart obvious quality work element tank gorilla view sugar picture humble"
+	v2KeysetId := "01df97b6fb8a572a718d7df7fcbf4387e2d455134ea8004c9c8c51e1b3391f909e"
+
+	seed := bip39.NewSeed(mnemonic, "")
+	master, err := hdkeychain.NewMaster(seed, &chaincfg.MainNetParams)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = DeriveKeysetPath(master, v2KeysetId)
+	if err != nil {
+		t.Fatalf("V2 keyset ID derivation failed: %v", err)
+	}
+}
+
+func TestKeysetIdToBigInt_HexInput(t *testing.T) {
+	result, err := keysetIdToBigInt("009a1f293253e41e")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Sign() <= 0 {
+		t.Fatalf("expected positive big.Int, got: %s", result.String())
+	}
+	maxMod := big.NewInt(2147483647)
+	if result.Cmp(maxMod) > 0 {
+		t.Fatalf("result should be < 2^31-1, got: %s", result.String())
+	}
+}
+
+func TestKeysetIdToBigInt_V2HexInput(t *testing.T) {
+	v2Id := "01df97b6fb8a572a718d7df7fcbf4387e2d455134ea8004c9c8c51e1b3391f909e"
+	result, err := keysetIdToBigInt(v2Id)
+	if err != nil {
+		t.Fatalf("V2 hex keyset ID failed: %v", err)
+	}
+	maxMod := big.NewInt(2147483647)
+	if result.Cmp(maxMod) > 0 {
+		t.Fatalf("result should be < 2^31-1, got: %s", result.String())
+	}
+}
+
+func TestCheckCollidingKeysets_NoCollision(t *testing.T) {
+	current := []string{"009a1f293253e41e"}
+	newIds := []string{"0039ff30789bc776"}
+	err := CheckCollidingKeysets(current, newIds)
+	if err != nil {
+		t.Fatalf("expected no collision, got: %v", err)
+	}
+}
+
+func TestCheckCollidingKeysets_ExactMatch(t *testing.T) {
+	current := []string{"009a1f293253e41e"}
+	newIds := []string{"009a1f293253e41e"}
+	err := CheckCollidingKeysets(current, newIds)
+	if err == nil {
+		t.Fatal("expected collision error for exact match")
+	}
+}
+
+func TestCheckCollidingKeysets_ModuloCollision(t *testing.T) {
+	id1 := "009a1f293253e41e"
+	bigId := "01df97b6fb8a572a718d7df7fcbf4387e2d455134ea8004c9c8c51e1b3391f909e"
+
+	r1, _ := keysetIdToBigInt(id1)
+	r2, _ := keysetIdToBigInt(bigId)
+	if r1.Cmp(r2) == 0 {
+		err := CheckCollidingKeysets([]string{id1}, []string{bigId})
+		if err == nil {
+			t.Fatal("expected collision for modulo-equal keysets")
+		}
+	}
 }
