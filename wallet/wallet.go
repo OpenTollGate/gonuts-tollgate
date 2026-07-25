@@ -1593,13 +1593,13 @@ func (w *Wallet) swapToSend(
 		return nil, err
 	}
 
-	for _, proof := range proofsToSwap {
-		w.db.DeleteProof(proof.Secret)
-	}
-
 	proofsFromSwap, err := constructProofs(swapResponse.Signatures, blindedMessages, secrets, rs, activeSatKeyset)
 	if err != nil {
 		return nil, fmt.Errorf("wallet.ConstructProofs: %v", err)
+	}
+
+	for _, proof := range proofsToSwap {
+		w.db.DeleteProof(proof.Secret)
 	}
 
 	proofsToSend := make(cashu.Proofs, len(send))
