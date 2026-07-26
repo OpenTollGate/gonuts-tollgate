@@ -49,10 +49,12 @@ var (
 	NSigsMustBeEqualErr      = cashu.Error{Detail: "all n_sigs must be the same for SIG_ALL", Code: NUT11ErrCode}
 )
 
+// NUT #11: Signatures are stored in `P2PKWitness` objects and are provided in either each `Proof.witness` of all inputs separately (for `SIG_INPUTS`) or only in the first input of the transaction (for `SIG_ALL`).
 type P2PKWitness struct {
 	Signatures []string `json:"signatures"`
 }
 
+// NUT #11: More complex spending conditions can be defined in the tags in `Secret.tags`.
 type P2PKTags struct {
 	Sigflag  string
 	NSigs    int
@@ -94,6 +96,7 @@ func SerializeP2PKTags(p2pkTags P2PKTags) [][]string {
 	return tags
 }
 
+// NUT #11: Each of the above tags may appear exactly **ONCE** in a P2PK secret. If a tag appears more than once, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 func ParseP2PKTags(tags [][]string) (*P2PKTags, error) {
 	if len(tags) > 5 {
 		return nil, TooManyTagsErr
@@ -347,6 +350,7 @@ func ParseSignature(signature string) (*schnorr.Signature, error) {
 	return sig, nil
 }
 
+// NUT #11: In the basic case, when spending a locked Proof, the mint requires one valid Schnorr signature in `Proof.witness.signatures` on `Proof.secret` by the public key in `Proof.secret.data`.
 func VerifyP2PKLockedProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret) error {
 	var p2pkWitness P2PKWitness
 	json.Unmarshal([]byte(proof.Witness), &p2pkWitness)

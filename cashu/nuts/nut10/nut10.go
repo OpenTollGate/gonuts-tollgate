@@ -8,6 +8,7 @@ import (
 	"fmt"
 )
 
+// NUT #10: In this NUT, we define a well-known format of `secret` that can be used to express more complex spending conditions.
 type SecretKind int
 
 const (
@@ -27,14 +28,18 @@ func (kind SecretKind) String() string {
 	}
 }
 
+// NUT #10: Spending conditions are enforced by the mint which means that, upon encountering a `Proof` where `Proof.secret` can be parsed into the well-known format, the mint can require additional conditions to be met.
 type WellKnownSecret struct {
 	Kind SecretKind
 	Data SecretData
 }
 
 type SecretData struct {
+	// NUT #10: `nonce` is a unique random string
 	Nonce string     `json:"nonce"`
+	// NUT #10: `data` expresses the spending condition specific to each kind
 	Data  string     `json:"data"`
+	// NUT #10: `tags` hold additional data committed to and can be used for feature extensions
 	Tags  [][]string `json:"tags"`
 }
 

@@ -12,6 +12,7 @@ import (
 
 // VerifyProofsDLEQ will verify the DLEQ proofs if present. If the DLEQ proofs are not present
 // it will continue and return true
+// NUT #12: If a DLEQ proof is included in a received token, wallets **MUST** verify the proof.
 func VerifyProofsDLEQ(proofs cashu.Proofs, keyset crypto.WalletKeyset) bool {
 	for _, proof := range proofs {
 		if proof.DLEQ == nil {
@@ -114,6 +115,7 @@ func VerifyProofsDLEQWithKeysets(proofs cashu.Proofs, activeKeyset crypto.Wallet
 	return allValid, nil
 }
 
+// NUT #12: To verify the DLEQ proof of a received token, `Carol` needs to reconstruct `B'` and `C'` using the blinding factor `r` that `Alice` has included in the `Proof` she sent to `Carol`.
 func VerifyProofDLEQ(
 	proof cashu.Proof,
 	A *secp256k1.PublicKey,
@@ -153,6 +155,7 @@ func VerifyProofDLEQ(
 	return crypto.VerifyDLEQ(e, s, A, B_, C_)
 }
 
+// NUT #12: If a DLEQ proof is included in the mint's `BlindSignature` response, wallets **MUST** verify the DLEQ proof.
 func VerifyBlindSignatureDLEQ(
 	dleq cashu.DLEQProof,
 	A *secp256k1.PublicKey,
@@ -185,6 +188,7 @@ func VerifyBlindSignatureDLEQ(
 	return crypto.VerifyDLEQ(e, s, A, B_, C_)
 }
 
+// NUT #12: `e` and `s` are the challenge and response of the DLEQ proof returned by `Bob`, `r` is the blinding factor of `Alice` that was used to generate the `Proof`.
 func ParseDLEQ(dleq cashu.DLEQProof) (
 	*secp256k1.PrivateKey,
 	*secp256k1.PrivateKey,

@@ -25,6 +25,7 @@ var (
 	InvalidHashErr     = cashu.Error{Detail: "Invalid hash in secret", Code: NUT14ErrCode}
 )
 
+// NUT #14: `HTLCWitness` is a serialized JSON string of the form
 type HTLCWitness struct {
 	Preimage   string   `json:"preimage"`
 	Signatures []string `json:"signatures"`
@@ -33,6 +34,7 @@ type HTLCWitness struct {
 // AddWitnessHTLC will add the preimage to the HTLCWitness.
 // It will also read the tags in the secret and add the signatures
 // if needed.
+// NUT #14: To successfully spend a Proof via the **Receiver Pathway**, the spender must present the matching `preimage_bytes`, encoded as a 64-character lowercase hexadecimal string in the `Proof.witness.preimage`.
 func AddWitnessHTLC(
 	proofs cashu.Proofs,
 	secret nut10.WellKnownSecret,
@@ -90,6 +92,7 @@ func AddWitnessHTLC(
 	return proofs, nil
 }
 
+// NUT #14: The hash lock in `Secret.data` and the preimage in `Proof.witness.preimage` are treated as 32-byte data, encoded as 64-character hexadecimal strings.
 func AddWitnessHTLCToOutputs(
 	outputs cashu.BlindedMessages,
 	preimage string,
@@ -118,6 +121,7 @@ func AddWitnessHTLCToOutputs(
 	return outputs, nil
 }
 
+// NUT #14: Aligned with Bitcoin's HTLC construction, the hash lock in `Secret.data` represents the **SHA-256 hash** of a 32-byte preimage.
 func VerifyHTLCProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret) error {
 	var htlcWitness HTLCWitness
 	json.Unmarshal([]byte(proof.Witness), &htlcWitness)

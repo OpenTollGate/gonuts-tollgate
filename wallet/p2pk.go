@@ -6,6 +6,7 @@ import (
 )
 
 // Derive key that wallet will use to receive locked ecash
+// NUT #11: Using P2PK, we can lock ecash Proofs (see [NUT-00][00]) to a receiver's ECC public key and require a Schnorr signature with the corresponding private key to unlock the ecash.
 func DeriveP2PK(key *hdkeychain.ExtendedKey) (*btcec.PrivateKey, error) {
 	// m/129372'
 	purpose, err := key.Derive(hdkeychain.HardenedKeyStart + 129372)
