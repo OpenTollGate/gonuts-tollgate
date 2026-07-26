@@ -32,7 +32,7 @@ const (
 	NUT11ErrCode cashu.CashuErrCode = 30001
 )
 
-// NUT-11 specific errors
+// NUT-11: specific errors
 var (
 	InvalidTagErr            = cashu.Error{Detail: "invalid tag", Code: NUT11ErrCode}
 	TooManyTagsErr           = cashu.Error{Detail: "too many tags", Code: NUT11ErrCode}

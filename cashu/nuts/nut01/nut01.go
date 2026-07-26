@@ -10,10 +10,12 @@ import (
 )
 
 type GetKeysResponse struct {
+	// NUT #01: Wallet user `Alice` receives public keys from mint `Bob` via `GET /v1/keys`.
 	Keysets []Keyset `json:"keysets"`
 }
 
 type Keyset struct {
+	// NUT #01: Keys in Keysets are maps of the form `{<amount_1> : <mint_pubkey_1>, <amount_2> : <mint_pubkey_2>, ...}`
 	Id   string            `json:"id"`
 	Unit string            `json:"unit"`
 	Keys crypto.PublicKeys `json:"keys"`

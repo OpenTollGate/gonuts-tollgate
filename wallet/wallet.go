@@ -346,6 +346,7 @@ func (w *Wallet) MintQuoteState(quoteId string) (*nut04.PostMintQuoteBolt11Respo
 // If successful, it will unblind the signatures to generate proofs
 // and store the proofs in the db.
 func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
+	// NUT #04: The mint verifies payment and returns blind signatures.
 	quote := w.db.GetMintQuoteById(quoteId)
 	if quote == nil {
 		return 0, ErrQuoteNotFound
@@ -632,7 +633,7 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 	proofsToSwap := token.Proofs()
 	tokenMint := token.Mint()
 
-	// NUT-00 V4 short keyset ID resolution: V4 tokens store keyset IDs as
+	// V4 short keyset ID resolution (NUT-00): V4 tokens store keyset IDs as
 	// 8-byte short IDs. Wallets MUST resolve these to full IDs before
 	// processing (sending to mint swap/melt endpoints).
 	proofsToSwap, err := resolveShortKeysetIds(proofsToSwap, tokenMint)
@@ -835,6 +836,7 @@ func (w *Wallet) createSwapRequest(proofs cashu.Proofs, mint *walletMint) (swapR
 
 // swap is declared as a variable so tests can override it.
 var swap = func(mint string, swapRequest swapRequestPayload) (cashu.Proofs, error) {
+	// NUT #03: These are then used by the wallet to generate new `Proofs`
 	request := nut03.PostSwapRequest{
 		Inputs:  swapRequest.inputs,
 		Outputs: swapRequest.outputs,
@@ -1035,6 +1037,7 @@ func (w *Wallet) CheckMeltQuoteState(quoteId string) (*nut05.PostMeltQuoteBolt11
 // Melt will melt proofs by requesting the mint to pay the
 // payment request from the melt quote passed
 func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error) {
+	// NUT #05: `fee_reserve` is the additional fee reserve for using the method
 	quote := w.db.GetMeltQuoteById(quoteId)
 	if quote == nil {
 		return nil, ErrQuoteNotFound
@@ -1075,7 +1078,7 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 	}
 	counter := w.counterForKeyset(activeKeyset.Id)
 
-	// NUT-08 include blank outputs in request for overpaid lightning fees
+	// Include blank outputs in request for overpaid lightning fees (NUT-08)
 	numBlankOutputs := calculateBlankOutputs(quote.FeeReserve)
 	split := make([]uint64, numBlankOutputs)
 	outputs, outputsSecrets, outputsRs, err := w.createBlindedMessages(split, activeKeyset.Id, &counter)

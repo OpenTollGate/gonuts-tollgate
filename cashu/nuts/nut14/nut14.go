@@ -19,7 +19,7 @@ const (
 	NUT14ErrCode cashu.CashuErrCode = 30004
 )
 
-// NUT-14 specific errors
+// NUT-14: specific errors
 var (
 	InvalidPreimageErr = cashu.Error{Detail: "Invalid preimage for HTLC", Code: NUT14ErrCode}
 	InvalidHashErr     = cashu.Error{Detail: "Invalid hash in secret", Code: NUT14ErrCode}

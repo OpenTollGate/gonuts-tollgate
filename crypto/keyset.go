@@ -20,6 +20,7 @@ import (
 const MAX_ORDER = 60
 
 type MintKeyset struct {
+	// NUT #01: The set of all public keys for a set of amounts is called a _keyset_.
 	Id                string
 	Unit              string
 	Active            bool
@@ -56,6 +57,7 @@ func DeriveKeysetPath(key *hdkeychain.ExtendedKey, index uint32) (*hdkeychain.Ex
 }
 
 func GenerateKeyset(master *hdkeychain.ExtendedKey, index uint32, inputFeePpk uint, active bool) (*MintKeyset, error) {
+	// NUT #01: Each keyset is identified by its keyset `id` which can be computed by anyone from its public keys (see [NUT-02][02]).
 	keys := make(map[uint64]KeyPair, MAX_ORDER)
 
 	keysetPath, err := DeriveKeysetPath(master, index)
@@ -165,6 +167,8 @@ func (pks PublicKeys) UnmarshalJSON(data []byte) error {
 // - take the first 14 characters of the hex-encoded hash
 // - prefix it with a keyset ID version byte
 func DeriveKeysetId(keyset PublicKeys) string {
+	// NUT #02: The keyset `id` is the identifier for a specific keyset and can be derived from the public keys and the metadata of a keyset.
+	// NUT #02: V1 keysets are 8 bytes long, including a version byte prefix `00`.
 	type pubkey struct {
 		amount uint64
 		pk     *secp256k1.PublicKey
@@ -190,6 +194,7 @@ func DeriveKeysetId(keyset PublicKeys) string {
 }
 
 func DeriveKeysetIdV2(keyset PublicKeys, unit string, inputFeePpk uint) string {
+	// NUT #02: Keyset IDs are 33 byte hex strings with a version byte (two hexadecimal characters). The currently used version byte is `01`.
 	type pubkey struct {
 		amount uint64
 		pk     *secp256k1.PublicKey
@@ -200,6 +205,7 @@ func DeriveKeysetIdV2(keyset PublicKeys, unit string, inputFeePpk uint) string {
 		pubkeys[i] = pubkey{amount, key}
 		i++
 	}
+	// NUT #02: sort public keys by their amount in ascending numerical order
 	sort.Slice(pubkeys, func(i, j int) bool {
 		return pubkeys[i].amount < pubkeys[j].amount
 	})

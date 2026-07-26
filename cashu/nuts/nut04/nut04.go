@@ -48,12 +48,14 @@ func StringToState(state string) State {
 	return Unknown
 }
 
+// NUT #04: `method` **MUST** match `[a-z0-9_-]+`.
 type PostMintQuoteBolt11Request struct {
 	Amount uint64 `json:"amount"`
 	Unit   string `json:"unit"`
 	Pubkey string `json:"pubkey,omitempty"`
 }
 
+// NUT #04: Mints **MUST** include `amount_paid`, `amount_issued`, and `updated_at` in all mint quote responses.
 type PostMintQuoteBolt11Response struct {
 	Quote   string `json:"quote"`
 	Request string `json:"request"`
@@ -70,6 +72,7 @@ type PostMintBolt11Request struct {
 	Signature string                `json:"signature,omitempty"`
 }
 
+// NUT #04: Mints **MUST NOT** issue ecash whose total output amount exceeds `amount_paid - amount_issued`.
 type PostMintBolt11Response struct {
 	Signatures cashu.BlindedSignatures `json:"signatures"`
 }

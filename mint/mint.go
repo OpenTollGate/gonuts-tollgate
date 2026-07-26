@@ -249,9 +249,11 @@ func (m *Mint) Shutdown() error {
 
 // RequestMintQuote will process a request to mint tokens
 // and returns a mint quote or an error.
-// The request to mint a token is explained in
-// NUT-04 here: https://github.com/cashubtc/nuts/blob/main/04.md.
+// The request to mint a token is explained in the spec here:
+// https://github.com/cashubtc/nuts/blob/main/04.md
 func (m *Mint) RequestMintQuote(mintQuoteRequest nut04.PostMintQuoteBolt11Request) (storage.MintQuote, error) {
+	// NUT #04: Mints **MUST** include `amount_paid`, `amount_issued`, and `updated_at` in all mint quote responses.
+
 	// only support sat unit
 	if mintQuoteRequest.Unit != cashu.Sat.String() {
 		errmsg := fmt.Sprintf("unit '%v' not supported", mintQuoteRequest.Unit)
@@ -362,6 +364,7 @@ func (m *Mint) GetMintQuoteState(quoteId string) (storage.MintQuote, error) {
 // MintTokens verifies whether the mint quote with id has been paid and proceeds to
 // sign the blindedMessages and return the BlindedSignatures if it was paid.
 func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.BlindedSignatures, error) {
+	// NUT #04: The total output amount **MUST NOT** exceed the quote's currently mintable amount, `amount_paid - amount_issued`.
 	mintQuote, err := m.GetMintQuoteState(mintTokensRequest.Quote)
 	if err != nil {
 		return nil, err
@@ -480,6 +483,7 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 // the proofs that were used as input.
 // It returns the BlindedSignatures.
 func (m *Mint) Swap(proofs cashu.Proofs, blindedMessages cashu.BlindedMessages) (cashu.BlindedSignatures, error) {
+	// NUT #03: Mints verify and invalidate the inputs and issue new promises (`BlindSignatures`).
 	var proofsAmount uint64
 	Ys := make([]string, len(proofs))
 	for i, proof := range proofs {
@@ -561,6 +565,7 @@ func (m *Mint) Swap(proofs cashu.Proofs, blindedMessages cashu.BlindedMessages) 
 // RequestMeltQuote will process a request to melt tokens and return a MeltQuote.
 // A melt is requested by a wallet to request the mint to pay an invoice.
 func (m *Mint) RequestMeltQuote(meltQuoteRequest nut05.PostMeltQuoteBolt11Request) (storage.MeltQuote, error) {
+	// NUT #05: `method` **MUST** match `[a-z0-9_-]+`.
 	if meltQuoteRequest.Unit != cashu.Sat.String() {
 		errmsg := fmt.Sprintf("unit '%v' not supported", meltQuoteRequest.Unit)
 		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.UnitErrCode)
@@ -767,6 +772,7 @@ func (m *Mint) removePendingProofsForQuote(quoteId string) (cashu.Proofs, error)
 // MeltTokens verifies whether proofs provided are valid
 // and proceeds to attempt payment.
 func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltBolt11Request) (storage.MeltQuote, error) {
+	// NUT #05: `inputs` are the proofs with a total amount sufficient to cover the requested amount plus any fees
 	proofs := meltTokensRequest.Inputs
 
 	var proofsAmount uint64

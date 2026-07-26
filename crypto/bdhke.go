@@ -30,6 +30,7 @@ const DomainSeparator = "Secp256k1_HashToCurve_Cashu_"
 // The domain separator is b"Secp256k1_HashToCurve_Cashu_" or
 // bytes.fromhex("536563703235366b315f48617368546f43757276655f43617368755f").
 func HashToCurve(message []byte) (*secp256k1.PublicKey, error) {
+	// NUT #00: Deterministically maps a message to a public key point on the secp256k1 curve, utilizing a domain separator to ensure uniqueness.
 	msgToHash := sha256.Sum256(append([]byte(DomainSeparator), message...))
 	var counter uint32 = 0
 	for counter < uint32(math.Exp2(16)) {
@@ -38,6 +39,7 @@ func HashToCurve(message []byte) (*secp256k1.PublicKey, error) {
 		binary.LittleEndian.PutUint32(c, counter)
 
 		hash := sha256.Sum256(append(msgToHash[:], c...))
+		// NUT #00: `Y = PublicKey('02' || SHA256(msg_hash || counter))` where `msg_hash` is `SHA256(DOMAIN_SEPARATOR || x)`
 		pkHash := append([]byte{0x02}, hash[:]...)
 		point, err := secp256k1.ParsePubKey(pkHash)
 		if err != nil {
@@ -55,6 +57,7 @@ func HashToCurve(message []byte) (*secp256k1.PublicKey, error) {
 func BlindMessage(secret string, r *secp256k1.PrivateKey) (*secp256k1.PublicKey,
 	*secp256k1.PrivateKey, error) {
 
+	// NUT #00: `Alice` sends to `Bob`: `B_ = Y + rG` with `r` being a random blinding factor (**blinding**)
 	var ypoint, rpoint, blindedMessage secp256k1.JacobianPoint
 	Y, err := HashToCurve([]byte(secret))
 	if err != nil {
@@ -75,6 +78,7 @@ func BlindMessage(secret string, r *secp256k1.PrivateKey) (*secp256k1.PublicKey,
 
 // C_ = kB_
 func SignBlindedMessage(B_ *secp256k1.PublicKey, k *secp256k1.PrivateKey) *secp256k1.PublicKey {
+	// NUT #00: `Bob` sends back to `Alice` blinded key: `C_ = kB_` (these two steps are the DH key exchange) (**signing**)
 	var bpoint, result secp256k1.JacobianPoint
 	B_.AsJacobian(&bpoint)
 
@@ -90,6 +94,7 @@ func SignBlindedMessage(B_ *secp256k1.PublicKey, k *secp256k1.PrivateKey) *secp2
 func UnblindSignature(C_ *secp256k1.PublicKey, r *secp256k1.PrivateKey,
 	K *secp256k1.PublicKey) *secp256k1.PublicKey {
 
+	// NUT #00: `Alice` can calculate the unblinded key as `C_ - rK = kY + krG - krG = kY = C` (**unblinding**)
 	var Kpoint, rKPoint, CPoint secp256k1.JacobianPoint
 	K.AsJacobian(&Kpoint)
 
@@ -109,6 +114,7 @@ func UnblindSignature(C_ *secp256k1.PublicKey, r *secp256k1.PrivateKey,
 
 // k * HashToCurve(secret) == C
 func Verify(secret string, k *secp256k1.PrivateKey, C *secp256k1.PublicKey) bool {
+	// NUT #00: `Carol` can send `(x, C)` to `Bob` who then checks that `k*hash_to_curve(x) == C` (**verification**)
 	Y, err := HashToCurve([]byte(secret))
 	if err != nil {
 		return false

@@ -59,6 +59,7 @@ func Restore(walletPath, mnemonic string, mintsToRestore []string) (uint64, erro
 			return 0, fmt.Errorf("error getting info from mint: %v", err)
 		}
 
+		// NUT #07: With the token state check, wallets can ask the mint whether a specific proof is already spent and whether it is in-flight in a transaction.
 		if !mintInfo.Nuts.Nut07.Supported || !mintInfo.Nuts.Nut09.Supported {
 			fmt.Println("mint does not support the necessary operations to restore wallet")
 			continue
@@ -190,8 +191,9 @@ func Restore(walletPath, mnemonic string, mintsToRestore []string) (uint64, erro
 
 				pendingProofs := make(cashu.Proofs, 0, len(proofStateResponse.States))
 
+				// NUT #07: Before deleting spent proofs from their database, wallets can check if the proof is `SPENT` to make sure that they don't accidentally delete an unspent proof.
 				for _, proofState := range proofStateResponse.States {
-					// NUT-07 can also respond with witness data. Since not supporting this yet, ignore proofs that have witness
+					// Per NUT-07, checkstate can also respond with witness data. Since not supporting this yet, ignore proofs that have witness
 					if len(proofState.Witness) > 0 {
 						break
 					}

@@ -10,17 +10,22 @@ import (
 )
 
 type MintInfo struct {
-	Name            string        `json:"name"`
-	Pubkey          string        `json:"pubkey"`
+	// NUT #06: (optional) `name` is the name of the mint and should be recognizable.
+	Name string `json:"name"`
+	// NUT #06: (optional) `pubkey` is the hex pubkey of the mint.
+	Pubkey string `json:"pubkey"`
+	// NUT #06: (optional) `version` is the implementation name and the version of the software running on this mint separated with a slash "/".
 	Version         string        `json:"version"`
 	Description     string        `json:"description"`
 	LongDescription string        `json:"description_long,omitempty"`
 	Contact         []ContactInfo `json:"contact,omitempty"`
-	Motd            string        `json:"motd,omitempty"`
-	IconURL         string        `json:"icon_url,omitempty"`
-	URLs            []string      `json:"urls,omitempty"`
-	Time            int64         `json:"time,omitempty"`
-	Nuts            Nuts          `json:"nuts"`
+	// NUT #06: (optional) `motd` is the message of the day that the wallet must display to the user.
+	Motd    string   `json:"motd,omitempty"`
+	IconURL string   `json:"icon_url,omitempty"`
+	URLs    []string `json:"urls,omitempty"`
+	Time    int64    `json:"time,omitempty"`
+	// NUT #06: (optional) `nuts` indicates each NUT specification that the mint supports and its settings.
+	Nuts Nuts `json:"nuts"`
 }
 
 type ContactInfo struct {

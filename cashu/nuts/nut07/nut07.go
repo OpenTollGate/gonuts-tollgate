@@ -8,8 +8,11 @@ import (
 type State int
 
 const (
+	// NUT #07: A proof is `UNSPENT` if it has not been spent yet
 	Unspent State = iota
+	// NUT #07: A proof is `PENDING` if it is being processed in a transaction (in an ongoing payment).
 	Pending
+	// NUT #07: A proof is `SPENT` if it has been redeemed and its secret is in the list of spent secrets of the mint.
 	Spent
 	Unknown
 )
@@ -40,10 +43,12 @@ func StringToState(state string) State {
 }
 
 type PostCheckStateRequest struct {
+	// NUT #07: the elements of the array in `Ys` are the hexadecimal representation of the compressed point `Y = hash_to_curve(secret)` of the `Proof` to check
 	Ys []string `json:"Ys"`
 }
 
 type PostCheckStateResponse struct {
+	// NUT #07: The elements of the `states` array MUST be returned in the same order as the corresponding `Ys` checked in the request.
 	States []ProofState `json:"states"`
 }
 

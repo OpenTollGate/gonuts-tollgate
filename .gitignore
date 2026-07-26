@@ -5,4 +5,6 @@ cmd/mint/mint-cli/mint-cli
 *.txt
 .vscode
 
-.DS_Store
+.DS_Storenuts/
+.coverage
+.spectate-*

@@ -1,0 +1,3 @@
+[submodule "nuts"]
+	path = nuts
+	url = https://github.com/cashubtc/nuts.git

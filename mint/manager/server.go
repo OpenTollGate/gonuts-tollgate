@@ -233,6 +233,7 @@ func (s *Server) handleIssuedEcashReq(req Request) (Response, *Error) {
 }
 
 func (s *Server) handleRedeemedEcashRequest(req Request) (Response, *Error) {
+	// NUT #07: A proof is `SPENT` if it has been redeemed and its secret is in the list of spent secrets of the mint.
 	if len(req.Params) > 0 {
 		redeemedEcashMap, err := s.mint.RedeemedEcash()
 		if err != nil {
