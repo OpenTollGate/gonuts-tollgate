@@ -2,6 +2,8 @@ package nut20
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -9,18 +11,59 @@ import (
 )
 
 // NUT #20: This NUT defines signature-based authentication for mint quote redemption.
+
+// buildMessageToSign constructs the NUT-20 binary message format:
+// b"Cashu_MintQuoteSig_v1" || len32(quote) || quote || for each output: len32(amount) || amount || len32(B) || B
+func buildMessageToSign(quoteId string, blindedMessages cashu.BlindedMessages) []byte {
+	var msg []byte
+	msg = append(msg, []byte("Cashu_MintQuoteSig_v1")...)
+
+	quoteBytes := []byte(quoteId)
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(quoteBytes)))
+	msg = append(msg, lenBuf[:]...)
+	msg = append(msg, quoteBytes...)
+
+	for _, bm := range blindedMessages {
+		amountBytes := canonicalAmountBytes(bm.Amount)
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(amountBytes)))
+		msg = append(msg, lenBuf[:]...)
+		msg = append(msg, amountBytes...)
+
+		bBytes, err := hex.DecodeString(bm.B_)
+		if err != nil {
+			bBytes = []byte(bm.B_)
+		}
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(bBytes)))
+		msg = append(msg, lenBuf[:]...)
+		msg = append(msg, bBytes...)
+	}
+
+	return msg
+}
+
+// canonicalAmountBytes converts an amount to minimal big-endian bytes (NUT-20 spec).
+func canonicalAmountBytes(amount uint64) []byte {
+	if amount == 0 {
+		return []byte{}
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], amount)
+	for i := 0; i < 8; i++ {
+		if buf[i] != 0 {
+			return buf[i:]
+		}
+	}
+	return buf[:]
+}
+
 func SignMintQuote(
 	privateKey *secp256k1.PrivateKey,
 	quoteId string,
 	blindedMessages cashu.BlindedMessages,
 ) (*schnorr.Signature, error) {
-	msg := quoteId
-	for _, bm := range blindedMessages {
-		msg += bm.B_
-	}
-
-	// NUT #20: To mint a quote where a public key was provided, the wallet includes a signature on `msg_to_sign` in the `PostMintBolt11Request`.
-	hash := sha256.Sum256([]byte(msg))
+	msg := buildMessageToSign(quoteId, blindedMessages)
+	hash := sha256.Sum256(msg)
 	sig, err := schnorr.Sign(privateKey, hash[:])
 	if err != nil {
 		return nil, err
@@ -36,12 +79,7 @@ func VerifyMintQuoteSignature(
 	blindedMessages cashu.BlindedMessages,
 	publicKey *secp256k1.PublicKey,
 ) bool {
-	msg := quoteId
-	for _, bm := range blindedMessages {
-		msg += bm.B_
-	}
-	hash := sha256.Sum256([]byte(msg))
-
-	// NUT #20: If the wallet user `Alice` does not include a signature on the `PostMintBolt11Request` but did include a `pubkey` in the `PostMintBolt11QuoteRequest` then `Bob` **MUST** respond with an error.
+	msg := buildMessageToSign(quoteId, blindedMessages)
+	hash := sha256.Sum256(msg)
 	return signature.Verify(hash[:], publicKey)
 }

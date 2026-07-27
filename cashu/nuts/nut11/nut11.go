@@ -103,12 +103,17 @@ func ParseP2PKTags(tags [][]string) (*P2PKTags, error) {
 	}
 
 	p2pkTags := P2PKTags{}
+	seen := map[string]bool{}
 
 	for _, tag := range tags {
 		if len(tag) < 2 {
 			return nil, InvalidTagErr
 		}
 		tagType := tag[0]
+		if seen[tagType] {
+			return nil, cashu.BuildCashuError("duplicate tag: "+tagType, NUT11ErrCode)
+		}
+		seen[tagType] = true
 		switch tagType {
 		case SIGFLAG:
 			sigflagType := tag[1]
