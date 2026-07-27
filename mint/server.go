@@ -23,6 +23,7 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut07"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut09"
+	"github.com/OpenTollGate/gonuts-tollgate/mint/storage"
 	"github.com/gorilla/mux"
 )
 
@@ -225,6 +226,13 @@ func setupHeaders(next http.Handler) http.Handler {
 	})
 }
 
+func amountPaidFromState(quote storage.MintQuote) uint64 {
+	if quote.State == nut04.Paid {
+		return quote.Amount
+	}
+	return 0
+}
+
 func (ms *MintServer) logRequest(req *http.Request, statusCode int, format string, args ...any) {
 	// this is done to preserve the source position in the log msg from where this
 	// method is called. Otherwise all messages would be logged with
@@ -364,12 +372,15 @@ func (ms *MintServer) mintRequest(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	mintQuoteResponse := nut04.PostMintQuoteBolt11Response{
-		Quote:   mintQuote.Id,
-		Request: mintQuote.PaymentRequest,
-		Amount:  mintQuote.Amount,
-		Unit:    cashu.Sat.String(),
-		State:   mintQuote.State,
-		Expiry:  mintQuote.Expiry,
+		Quote:        mintQuote.Id,
+		Request:      mintQuote.PaymentRequest,
+		Amount:       mintQuote.Amount,
+		Unit:         cashu.Sat.String(),
+		State:        mintQuote.State,
+		Expiry:       mintQuote.Expiry,
+		AmountPaid:   amountPaidFromState(mintQuote),
+		AmountIssued: 0,
+		UpdatedAt:    uint64(time.Now().Unix()),
 	}
 	if mintQuote.Pubkey != nil {
 		mintQuoteResponse.Pubkey = hex.EncodeToString(mintQuote.Pubkey.SerializeCompressed())
@@ -411,12 +422,15 @@ func (ms *MintServer) mintQuoteState(rw http.ResponseWriter, req *http.Request) 
 	}
 
 	mintQuoteStateResponse := nut04.PostMintQuoteBolt11Response{
-		Quote:   mintQuote.Id,
-		Request: mintQuote.PaymentRequest,
-		Amount:  mintQuote.Amount,
-		Unit:    cashu.Sat.String(),
-		State:   mintQuote.State,
-		Expiry:  mintQuote.Expiry,
+		Quote:        mintQuote.Id,
+		Request:      mintQuote.PaymentRequest,
+		Amount:       mintQuote.Amount,
+		Unit:         cashu.Sat.String(),
+		State:        mintQuote.State,
+		Expiry:       mintQuote.Expiry,
+		AmountPaid:   amountPaidFromState(mintQuote),
+		AmountIssued: 0,
+		UpdatedAt:    uint64(time.Now().Unix()),
 	}
 	if mintQuote.Pubkey != nil {
 		mintQuoteStateResponse.Pubkey = hex.EncodeToString(mintQuote.Pubkey.SerializeCompressed())

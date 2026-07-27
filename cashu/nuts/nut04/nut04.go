@@ -57,13 +57,16 @@ type PostMintQuoteBolt11Request struct {
 
 // NUT #04: Mints **MUST** include `amount_paid`, `amount_issued`, and `updated_at` in all mint quote responses.
 type PostMintQuoteBolt11Response struct {
-	Quote   string `json:"quote"`
-	Request string `json:"request"`
-	Amount  uint64 `json:"amount"`
-	Unit    string `json:"unit"`
-	State   State  `json:"state"`
-	Expiry  uint64 `json:"expiry"`
-	Pubkey  string `json:"pubkey,omitempty"`
+	Quote        string `json:"quote"`
+	Request      string `json:"request"`
+	Amount       uint64 `json:"amount"`
+	Unit         string `json:"unit"`
+	State        State  `json:"state"`
+	Expiry       uint64 `json:"expiry"`
+	Pubkey       string `json:"pubkey,omitempty"`
+	AmountPaid   uint64 `json:"amount_paid"`
+	AmountIssued uint64 `json:"amount_issued"`
+	UpdatedAt    uint64 `json:"updated_at"`
 }
 
 type PostMintBolt11Request struct {
@@ -78,24 +81,30 @@ type PostMintBolt11Response struct {
 }
 
 type tempQuote struct {
-	Quote   string `json:"quote"`
-	Request string `json:"request"`
-	Amount  uint64 `json:"amount"`
-	Unit    string `json:"unit"`
-	State   string `json:"state"`
-	Expiry  uint64 `json:"expiry"`
-	Pubkey  string `json:"pubkey,omitempty"`
+	Quote        string `json:"quote"`
+	Request      string `json:"request"`
+	Amount       uint64 `json:"amount"`
+	Unit         string `json:"unit"`
+	State        string `json:"state"`
+	Expiry       uint64 `json:"expiry"`
+	Pubkey       string `json:"pubkey,omitempty"`
+	AmountPaid   uint64 `json:"amount_paid"`
+	AmountIssued uint64 `json:"amount_issued"`
+	UpdatedAt    uint64 `json:"updated_at"`
 }
 
 func (quoteResponse *PostMintQuoteBolt11Response) MarshalJSON() ([]byte, error) {
 	var tempQuote = tempQuote{
-		Quote:   quoteResponse.Quote,
-		Request: quoteResponse.Request,
-		Amount:  quoteResponse.Amount,
-		Unit:    quoteResponse.Unit,
-		State:   quoteResponse.State.String(),
-		Expiry:  quoteResponse.Expiry,
-		Pubkey:  quoteResponse.Pubkey,
+		Quote:        quoteResponse.Quote,
+		Request:      quoteResponse.Request,
+		Amount:       quoteResponse.Amount,
+		Unit:         quoteResponse.Unit,
+		State:        quoteResponse.State.String(),
+		Expiry:       quoteResponse.Expiry,
+		Pubkey:       quoteResponse.Pubkey,
+		AmountPaid:   quoteResponse.AmountPaid,
+		AmountIssued: quoteResponse.AmountIssued,
+		UpdatedAt:    quoteResponse.UpdatedAt,
 	}
 	return json.Marshal(tempQuote)
 }
@@ -115,6 +124,9 @@ func (quoteResponse *PostMintQuoteBolt11Response) UnmarshalJSON(data []byte) err
 	quoteResponse.State = state
 	quoteResponse.Expiry = tempQuote.Expiry
 	quoteResponse.Pubkey = tempQuote.Pubkey
+	quoteResponse.AmountPaid = tempQuote.AmountPaid
+	quoteResponse.AmountIssued = tempQuote.AmountIssued
+	quoteResponse.UpdatedAt = tempQuote.UpdatedAt
 
 	return nil
 }

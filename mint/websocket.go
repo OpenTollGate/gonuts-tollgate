@@ -254,10 +254,13 @@ func (c *Client) subscriptionRequest(req nut17.WsRequest) (*nut17.WsResponse, *n
 		go func() {
 			for _, quote := range quotes {
 				firstQuoteState := nut04.PostMintQuoteBolt11Response{
-					Quote:   quote.Id,
-					Request: quote.PaymentRequest,
-					State:   quote.State,
-					Expiry:  quote.Expiry,
+					Quote:        quote.Id,
+					Request:      quote.PaymentRequest,
+					State:        quote.State,
+					Expiry:       quote.Expiry,
+					AmountPaid:   amountPaidFromState(quote),
+					AmountIssued: 0,
+					UpdatedAt:    uint64(time.Now().Unix()),
 				}
 				jsonPayload, _ := json.Marshal(&firstQuoteState)
 				wsNotif := nut17.WsNotification{
@@ -465,10 +468,13 @@ func (subClient *MintQuotesSubClient) Read() <-chan nut17.WsNotification {
 						subClient.quotes[mintQuote.Id] = mintQuote.State
 
 						newQuoteState := nut04.PostMintQuoteBolt11Response{
-							Quote:   mintQuote.Id,
-							Request: mintQuote.PaymentRequest,
-							State:   mintQuote.State,
-							Expiry:  mintQuote.Expiry,
+							Quote:        mintQuote.Id,
+							Request:      mintQuote.PaymentRequest,
+							State:        mintQuote.State,
+							Expiry:       mintQuote.Expiry,
+							AmountPaid:   amountPaidFromState(mintQuote),
+							AmountIssued: 0,
+							UpdatedAt:    uint64(time.Now().Unix()),
 						}
 						notificationPayload, _ := json.Marshal(&newQuoteState)
 

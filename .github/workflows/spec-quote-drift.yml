@@ -1,0 +1,60 @@
+---
+# Workflow: greatspectations spec-quote drift detection for gonuts-tollgate.
+#
+# Catches when OUR CODE drifts from the cashubtc/nuts spec by checking that
+# embedded `// NUT #NN: <quote>` comments match the current spec text verbatim.
+#
+# Tool: https://github.com/rustyrussell/greatspectations
+# Spec:  https://github.com/cashubtc/nuts
+
+name: spec-quote-drift
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  spectate:
+    name: greatspectations spec-quote check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install greatspectations
+        run: |
+          git clone --depth=1 https://github.com/rustyrussell/greatspectations.git /tmp/gs
+          pip install -e /tmp/gs
+
+      - name: Clone cashubtc/nuts spec
+        run: git clone --depth=1 https://github.com/cashubtc/nuts.git nuts
+
+      - name: Run spectate check (spec-quote drift)
+        run: |
+          spectate check --config specquotes.toml \
+            --comment-start '// ' --comment-continue '//' \
+            -k $(find . -name '*.go' -not -name '*_test.go' -not -path './vendor/*' -not -path './.git/*' -not -path './nuts/*')
+
+      - name: Run spectate coverage (uncovered MUST clauses)
+        run: |
+          spectate check --config specquotes.toml \
+            --comment-start '// ' --comment-continue '//' --coverage .coverage \
+            -k $(find . -name '*.go' -not -name '*_test.go' -not -path './vendor/*' -not -path './.git/*' -not -path './nuts/*')
+          spectate coverage --config specquotes.toml --coverage .coverage --all-sections
+        continue-on-error: true
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spec-coverage-report
+          path: .coverage
+          if-no-files-found: ignore
+          retention-days: 14
