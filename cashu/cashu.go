@@ -272,15 +272,15 @@ func (t TokenV3) Serialize() (string, error) {
 }
 
 type TokenV4 struct {
-	TokenProofs []TokenV4Proof `json:"t"`
-	Memo        string         `json:"d,omitempty"`
-	MintURL     string         `json:"m"`
-	Unit        string         `json:"u"`
+	TokenProofs []TokenV4Proof `json:"t" cbor:"t"`
+	Memo        string         `json:"d,omitempty" cbor:"d,omitempty"`
+	MintURL     string         `json:"m" cbor:"m"`
+	Unit        string         `json:"u" cbor:"u"`
 }
 
 type TokenV4Proof struct {
-	Id     []byte    `json:"i"`
-	Proofs []ProofV4 `json:"p"`
+	Id     []byte    `json:"i" cbor:"i"`
+	Proofs []ProofV4 `json:"p" cbor:"p"`
 }
 
 func (tp *TokenV4Proof) MarshalJSON() ([]byte, error) {
@@ -295,11 +295,11 @@ func (tp *TokenV4Proof) MarshalJSON() ([]byte, error) {
 }
 
 type ProofV4 struct {
-	Amount  uint64  `json:"a"`
-	Secret  string  `json:"s"`
-	C       []byte  `json:"c"`
-	Witness string  `json:"w,omitempty"`
-	DLEQ    *DLEQV4 `json:"d,omitempty"`
+	Amount  uint64  `json:"a" cbor:"a"`
+	Secret  string  `json:"s" cbor:"s"`
+	C       []byte  `json:"c" cbor:"c"`
+	Witness string  `json:"w,omitempty" cbor:"w,omitempty"`
+	DLEQ    *DLEQV4 `json:"d,omitempty" cbor:"d,omitempty"`
 }
 
 func (p *ProofV4) MarshalJSON() ([]byte, error) {
@@ -320,9 +320,9 @@ func (p *ProofV4) MarshalJSON() ([]byte, error) {
 }
 
 type DLEQV4 struct {
-	E []byte `json:"e"`
-	S []byte `json:"s"`
-	R []byte `json:"r"`
+	E []byte `json:"e" cbor:"e"`
+	S []byte `json:"s" cbor:"s"`
+	R []byte `json:"r" cbor:"r"`
 }
 
 func (d *DLEQV4) MarshalJSON() ([]byte, error) {
