@@ -46,10 +46,14 @@ func AddWitnessHTLC(
 		return nil, err
 	}
 
+	requiredSigs := tags.NSigs
+	if requiredSigs == 0 && len(tags.Pubkeys) > 0 {
+		requiredSigs = 1
+	}
+
 	signatureNeeded := false
-	if tags.NSigs > 0 {
-		// return error if it requires more than 1 signature
-		if tags.NSigs > 1 {
+	if requiredSigs > 0 {
+		if requiredSigs > 1 {
 			return nil, errors.New("unable to provide enough signatures")
 		}
 
@@ -163,8 +167,12 @@ func VerifyHTLCProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret) error
 		return InvalidPreimageErr
 	}
 
-	// if n_sigs flag present, verify signatures
-	if p2pkTags.NSigs > 0 {
+	verifySigs := p2pkTags.NSigs
+	if verifySigs == 0 && len(p2pkTags.Pubkeys) > 0 {
+		verifySigs = 1
+	}
+
+	if verifySigs > 0 {
 		if len(htlcWitness.Signatures) < 1 {
 			return nut11.NoSignaturesErr
 		}
@@ -175,7 +183,7 @@ func VerifyHTLCProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret) error
 			return nut11.DuplicateSignaturesErr
 		}
 
-		if !nut11.HasValidSignatures(hash[:], htlcWitness.Signatures, p2pkTags.NSigs, p2pkTags.Pubkeys) {
+		if !nut11.HasValidSignatures(hash[:], htlcWitness.Signatures, verifySigs, p2pkTags.Pubkeys) {
 			return nut11.NotEnoughSignaturesErr
 		}
 	}
