@@ -1061,16 +1061,24 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 
 	mint := w.mints[quote.Mint]
 
+	// Lock proof selection + pending marking to prevent two concurrent
+	// Melt() calls (e.g. from MultiMintPayment goroutines) from selecting
+	// the same proofs and double-spending. The melt HTTP request itself
+	// stays outside the lock so MPP parts fire concurrently.
+	w.mu.Lock()
 	amountNeeded := quote.Amount + quote.FeeReserve
 	proofs, err := w.getProofsForAmount(amountNeeded, &mint, true)
 	if err != nil {
+		w.mu.Unlock()
 		return nil, err
 	}
 
 	// set proofs to pending
 	if err := w.db.AddPendingProofsByQuoteId(proofs, quote.QuoteId); err != nil {
+		w.mu.Unlock()
 		return nil, fmt.Errorf("error saving pending proofs: %w", err)
 	}
+	w.mu.Unlock()
 
 	activeKeyset, err := w.getActiveKeyset(mint.mintURL)
 	if err != nil {
@@ -1267,13 +1275,16 @@ func (w *Wallet) MultiMintPayment(request string, split map[string]uint64) ([]nu
 	}
 
 	meltResponses := make([]result, len(meltQuotes))
+	var wg sync.WaitGroup
 	for i, meltQuote := range meltQuotes {
-		meltResponse, err := w.Melt(meltQuote)
-		meltResponses[i] = result{response: meltResponse, err: err}
-		if err != nil {
-			break
-		}
+		wg.Add(1)
+		go func(i int, quote string) {
+			defer wg.Done()
+			meltResponse, err := w.Melt(quote)
+			meltResponses[i] = result{response: meltResponse, err: err}
+		}(i, meltQuote)
 	}
+	wg.Wait()
 
 	meltQuoteResponses := make([]nut05.PostMeltQuoteBolt11Response, len(split))
 	for i, result := range meltResponses {
