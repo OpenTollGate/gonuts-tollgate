@@ -1267,16 +1267,13 @@ func (w *Wallet) MultiMintPayment(request string, split map[string]uint64) ([]nu
 	}
 
 	meltResponses := make([]result, len(meltQuotes))
-	var wg sync.WaitGroup
 	for i, meltQuote := range meltQuotes {
-		wg.Add(1)
-		go func(quote string) {
-			defer wg.Done()
-			meltResponse, err := w.Melt(quote)
-			meltResponses[i] = result{response: meltResponse, err: err}
-		}(meltQuote)
+		meltResponse, err := w.Melt(meltQuote)
+		meltResponses[i] = result{response: meltResponse, err: err}
+		if err != nil {
+			break
+		}
 	}
-	wg.Wait()
 
 	meltQuoteResponses := make([]nut05.PostMeltQuoteBolt11Response, len(split))
 	for i, result := range meltResponses {
