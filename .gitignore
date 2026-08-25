@@ -8,3 +8,4 @@ cmd/mint/mint-cli/mint-cli
 .DS_Storenuts/
 .coverage
 .spectate-*
+recover

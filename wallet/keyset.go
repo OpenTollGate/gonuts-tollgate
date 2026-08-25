@@ -10,8 +10,41 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/wallet/client"
 )
 
-// GetMintActiveKeyset gets the active keyset with the specified unit
+// GetMintActiveKeyset gets the active keyset with the specified unit.
+// Uses GET /v1/keys (single call) which returns active keysets WITH keys,
+// instead of GET /v1/keysets + GET /v1/keys/{id} (two calls) where the
+// second call fails with 400 "unknown keyset" on some mints.
 func GetMintActiveKeyset(mintURL string, unit cashu.Unit) (*crypto.WalletKeyset, error) {
+	keysets, err := client.GetActiveKeysets(mintURL)
+	if err != nil {
+		// Fallback: try the two-call approach if /v1/keys fails entirely
+		return getMintActiveKeysetFallback(mintURL, unit)
+	}
+
+	for _, keyset := range keysets.Keysets {
+		if keyset.Active && keyset.Unit == unit.String() {
+			_, err := hex.DecodeString(keyset.Id)
+			if err == nil {
+				return &crypto.WalletKeyset{
+					Id:          keyset.Id,
+					MintURL:     mintURL,
+					Unit:        keyset.Unit,
+					Active:      true,
+					PublicKeys:  keyset.Keys,
+					InputFeePpk: keyset.InputFeePpk,
+				}, nil
+			}
+		}
+	}
+
+	// No active keyset with keys found via /v1/keys, try two-call approach
+	return getMintActiveKeysetFallback(mintURL, unit)
+}
+
+// getMintActiveKeysetFallback is the legacy two-call approach: GET /v1/keysets
+// to discover the keyset ID, then GET /v1/keys/{id} to fetch keys. Used as a
+// fallback when GetActiveKeysets (/v1/keys) doesn't return active keysets with keys.
+func getMintActiveKeysetFallback(mintURL string, unit cashu.Unit) (*crypto.WalletKeyset, error) {
 	keysets, err := client.GetAllKeysets(mintURL)
 	if err != nil {
 		return nil, fmt.Errorf("error getting active keysets from mint: %w", err)
@@ -66,6 +99,18 @@ func GetMintInactiveKeysets(mintURL string, unit cashu.Unit) (map[string]crypto.
 func GetKeysetKeys(mintURL, id string) (crypto.PublicKeys, error) {
 	keysetsResponse, err := client.GetKeysetById(mintURL, id)
 	if err != nil {
+		// Fallback: GET /v1/keys returns all active keysets with keys.
+		// Some mints return 400 "unknown keyset" for GET /v1/keys/{id}
+		// even when the keyset is active and returned by GET /v1/keys.
+		allKeys, fallbackErr := client.GetActiveKeysets(mintURL)
+		if fallbackErr != nil {
+			return nil, fmt.Errorf("error getting keyset from mint: %w", err)
+		}
+		for _, ks := range allKeys.Keysets {
+			if ks.Id == id {
+				return ks.Keys, nil
+			}
+		}
 		return nil, fmt.Errorf("error getting keyset from mint: %w", err)
 	}
 

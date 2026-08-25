@@ -19,6 +19,11 @@ type Keyset struct {
 	Id   string            `json:"id"`
 	Unit string            `json:"unit"`
 	Keys crypto.PublicKeys `json:"keys"`
+	// NUT #02: These fields are also present in GET /v1/keys responses
+	// on NUT-01-compliant mints. Parsing them here lets us avoid a
+	// separate GET /v1/keys/{id} call that fails with 400 on some mints.
+	Active      bool `json:"active"`
+	InputFeePpk uint `json:"input_fee_ppk"`
 }
 
 func (kr *GetKeysResponse) UnmarshalJSON(data []byte) error {
@@ -44,9 +49,11 @@ func (kr *GetKeysResponse) UnmarshalJSON(data []byte) error {
 
 func (ks *Keyset) UnmarshalJSON(data []byte) error {
 	var tempKeyset struct {
-		Id   string
-		Unit string
-		Keys json.RawMessage
+		Id          string
+		Unit        string
+		Keys        json.RawMessage
+		Active      bool `json:"active"`
+		InputFeePpk uint `json:"input_fee_ppk"`
 	}
 
 	if err := json.Unmarshal(data, &tempKeyset); err != nil {
@@ -55,6 +62,8 @@ func (ks *Keyset) UnmarshalJSON(data []byte) error {
 
 	ks.Id = tempKeyset.Id
 	ks.Unit = tempKeyset.Unit
+	ks.Active = tempKeyset.Active
+	ks.InputFeePpk = tempKeyset.InputFeePpk
 
 	publicKeys := make(crypto.PublicKeys, len(tempKeyset.Keys))
 	if err := json.Unmarshal(tempKeyset.Keys, &publicKeys); err != nil {
