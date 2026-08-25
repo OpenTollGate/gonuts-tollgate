@@ -209,7 +209,25 @@ func (w *Wallet) getActiveKeyset(mintURL string) (*crypto.WalletKeyset, error) {
 					mint.activeKeyset = activeKeyset
 					delete(mint.inactiveKeysets, storedKeyset.Id)
 				} else {
-					keys, err := GetKeysetKeys(mintURL, keyset.Id)
+					// Use GET /v1/keys (single call) to get keys, which returns
+					// all active keysets WITH keys. This avoids the broken
+					// GET /v1/keys/{id} endpoint that fails with 400 "unknown
+					// keyset" on some mints (e.g. coinos). Falls back to
+					// GetKeysetKeys only if GetActiveKeysets fails entirely.
+					keys, err := func() (crypto.PublicKeys, error) {
+						allKeys, gakErr := client.GetActiveKeysets(mintURL)
+						if gakErr != nil {
+							// Fallback to two-call approach
+							return GetKeysetKeys(mintURL, keyset.Id)
+						}
+						for _, ks := range allKeys.Keysets {
+							if ks.Id == keyset.Id && ks.Active {
+								return ks.Keys, nil
+							}
+						}
+						// Keyset not found in /v1/keys response, fall back
+						return GetKeysetKeys(mintURL, keyset.Id)
+					}()
 					if err != nil {
 						return nil, err
 					}
