@@ -658,6 +658,10 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 		return 0, errors.New("invalid DLEQ proof")
 	}
 
+	if len(proofsToSwap) == 0 {
+		return 0, errors.New("no proofs in token")
+	}
+
 	// if P2PK, add signature to Witness in the proofs
 	nut10Secret, err := nut10.DeserializeSecret(proofsToSwap[0].Secret)
 	if err == nil && nut10Secret.Kind == nut10.P2PK {
