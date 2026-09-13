@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
@@ -34,9 +35,23 @@ type BoltDB struct {
 	bolt *bolt.DB
 }
 
+// ErrDBLocked is returned when wallet.db cannot be opened because another
+// wallet instance — in this process or another — still holds it. Without
+// the open timeout, bolt.Open blocked forever on the file lock, which made
+// a second in-process LoadWallet deadlock instead of failing.
+var ErrDBLocked = errors.New("wallet database is locked")
+
+// boltOpenTimeout bounds how long InitBolt waits for the database file lock
+// before returning ErrDBLocked.
+const boltOpenTimeout = 5 * time.Second
+
 func InitBolt(path string) (*BoltDB, error) {
-	db, err := bolt.Open(filepath.Join(path, "wallet.db"), 0600, nil)
+	db, err := bolt.Open(filepath.Join(path, "wallet.db"), 0600, &bolt.Options{Timeout: boltOpenTimeout})
 	if err != nil {
+		if errors.Is(err, bolt.ErrTimeout) {
+			return nil, fmt.Errorf("%w: another wallet still holds %s — Shutdown the previous wallet before loading again: %w",
+				ErrDBLocked, filepath.Join(path, "wallet.db"), err)
+		}
 		return nil, fmt.Errorf("error setting bolt db: %v", err)
 	}
 
