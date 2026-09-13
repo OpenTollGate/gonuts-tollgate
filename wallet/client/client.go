@@ -259,6 +259,22 @@ func PostSwap(mintURL string, swapRequest nut03.PostSwapRequest) (*nut03.PostSwa
 		return nil, err
 	}
 
+	// A rejected swap MUST surface the mint's NUT error, not an empty one.
+	// The response is unmarshalled into PostSwapResponse regardless of the
+	// status code below, so without this check a 4xx body like
+	// {"code":3,"detail":"inputs have already been spent"} parsed as an
+	// empty success-shaped struct and callers saw "could not swap proofs: "
+	// with nothing after the colon. cashu.Error is wrapped (not stringified)
+	// so errors.As keeps matching BlindedMessageAlreadySignedErrCode in the
+	// wallet's retry path.
+	if resp.StatusCode != http.StatusOK {
+		var cashuErr cashu.Error
+		if json.Unmarshal(body, &cashuErr) == nil && cashuErr.Code != 0 {
+			return nil, fmt.Errorf("swap rejected by mint (HTTP %d, code %d): %w", resp.StatusCode, cashuErr.Code, &cashuErr)
+		}
+		return nil, fmt.Errorf("swap rejected by mint (HTTP %d): %s", resp.StatusCode, string(body))
+	}
+
 	var swapResponse nut03.PostSwapResponse
 	if err := json.Unmarshal(body, &swapResponse); err != nil {
 		return nil, fmt.Errorf("error reading response from mint: %v", err)
