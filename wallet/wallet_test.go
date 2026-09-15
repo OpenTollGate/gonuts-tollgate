@@ -5,17 +5,21 @@ package wallet
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"runtime"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/OpenTollGate/gonuts-tollgate/crypto"
+	"github.com/OpenTollGate/gonuts-tollgate/wallet/storage"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil/hdkeychain"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -274,8 +278,8 @@ func generateWalletKeyset(seed, derivationPath string, active bool, mintURL stri
 // ---------------------------------------------------------------------------
 
 const (
-	v2ShortID = "01df97b6fb8a572a"
-	v2FullID  = "01df97b6fb8a572a718d7df7fcbf4387e2d455134ea8004c9c8c51e1b3391f909e"
+	v2ShortID  = "01df97b6fb8a572a"
+	v2FullID   = "01df97b6fb8a572a718d7df7fcbf4387e2d455134ea8004c9c8c51e1b3391f909e"
 	v1KeysetID = "009a1f293253e41e"
 )
 
@@ -354,5 +358,76 @@ func TestResolveShortKeysetIds_MintUnreachable(t *testing.T) {
 	_, err := resolveShortKeysetIds(proofs, "http://localhost:1/no-server")
 	if err == nil {
 		t.Fatal("expected error for unreachable mint, got nil")
+	}
+}
+
+// TestLoadWallet_SecondInProcessCallWithoutShutdownDoesNotBlock is the
+// regression test for the LoadWallet deadlock: bolt.Open takes an exclusive
+// flock on wallet.db, so loading a wallet twice in one process while the
+// first is still open used to block forever on the second bolt.Open (nil
+// Options means no timeout). The test loads once, then attempts a second
+// load WITHOUT Shutdown-ing the first — the second call must either succeed
+// or return an error within the watchdog window, never deadlock.
+func TestLoadWallet_SecondInProcessCallWithoutShutdownDoesNotBlock(t *testing.T) {
+	cfg := Config{
+		WalletPath:     t.TempDir(),
+		CurrentMintURL: "http://127.0.0.1:1", // loopback refuse → offline mode, no network
+	}
+
+	first, err := LoadWallet(cfg)
+	if err != nil {
+		t.Fatalf("first LoadWallet: %v", err)
+	}
+	defer first.Shutdown()
+
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		second, lerr := LoadWallet(cfg)
+		if lerr == nil {
+			err = second.Shutdown()
+		} else {
+			err = lerr
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		// The fix converts the former infinite flock wait into either a
+		// successful load or the clear ErrDBLocked sentinel — never a hang.
+		if err != nil && !errors.Is(err, storage.ErrDBLocked) {
+			t.Fatalf("second LoadWallet returned an unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Minute): // > boltOpenTimeout + offline retry budget
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("second in-process LoadWallet deadlocked (first wallet not Shutdown); goroutine dump:\n%s", buf[:n])
+	}
+}
+
+// TestLoadWallet_ReloadAfterShutdownSucceeds pins the supported flow the
+// integration suite already uses: Shutdown the first wallet, then load the
+// same path again — the fix must not break it.
+func TestLoadWallet_ReloadAfterShutdownSucceeds(t *testing.T) {
+	cfg := Config{
+		WalletPath:     t.TempDir(),
+		CurrentMintURL: "http://127.0.0.1:1",
+	}
+
+	first, err := LoadWallet(cfg)
+	if err != nil {
+		t.Fatalf("first LoadWallet: %v", err)
+	}
+	if err := first.Shutdown(); err != nil {
+		t.Fatalf("first Shutdown: %v", err)
+	}
+
+	second, err := LoadWallet(cfg)
+	if err != nil {
+		t.Fatalf("reload after Shutdown: %v", err)
+	}
+	if err := second.Shutdown(); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
 	}
 }
