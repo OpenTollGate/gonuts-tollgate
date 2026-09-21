@@ -363,13 +363,26 @@ func (db *BoltDB) DeletePendingProofsByQuoteId(quoteId string) error {
 // http://mint.com will create a bucket inside the KEYSETS_BUCKET named by the mint URL
 // and inside this bucket, save the keysets by keyset id
 func (db *BoltDB) SaveKeyset(keyset *crypto.WalletKeyset) error {
-	jsonKeyset, err := json.Marshal(keyset)
-	if err != nil {
-		return fmt.Errorf("invalid keyset format: %v", err)
-	}
-
 	if err := db.bolt.Update(func(tx *bolt.Tx) error {
 		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
+
+		// The same keyset id can exist under several mint-URL spellings
+		// (trailing slash, casing, …), each bucket holding its own copy of
+		// the serialized keyset — including the derivation Counter. A save
+		// of a freshly fetched keyset carries Counter 0 and would silently
+		// rewind a copy that already advanced, making the wallet re-derive
+		// blinded messages the mint has already seen ("Duplicate outputs").
+		// The counter is monotonic: never save a value below the highest
+		// one already stored for this keyset id.
+		if existing := maxKeysetCounterTx(keysetsb, keyset.Id); keyset.Counter < existing {
+			keyset.Counter = existing
+		}
+
+		jsonKeyset, err := json.Marshal(keyset)
+		if err != nil {
+			return fmt.Errorf("invalid keyset format: %v", err)
+		}
+
 		mintBucket, err := keysetsb.CreateBucketIfNotExists([]byte(keyset.MintURL))
 		if err != nil {
 			return err
@@ -379,6 +392,31 @@ func (db *BoltDB) SaveKeyset(keyset *crypto.WalletKeyset) error {
 		return fmt.Errorf("error saving keyset: %v", err)
 	}
 	return nil
+}
+
+// maxKeysetCounterTx returns the highest derivation counter stored for
+// keysetId across every mint-URL bucket that holds a copy of it.
+func maxKeysetCounterTx(keysetsb *bolt.Bucket, keysetId string) uint32 {
+	var max uint32
+	_ = keysetsb.ForEach(func(mintURL, _ []byte) error {
+		mintBucket := keysetsb.Bucket(mintURL)
+		if mintBucket == nil {
+			return nil
+		}
+		keysetBytes := mintBucket.Get([]byte(keysetId))
+		if keysetBytes == nil {
+			return nil
+		}
+		var keyset crypto.WalletKeyset
+		if err := json.Unmarshal(keysetBytes, &keyset); err != nil {
+			return nil
+		}
+		if keyset.Counter > max {
+			max = keyset.Counter
+		}
+		return nil
+	})
+	return max
 }
 
 func (db *BoltDB) GetKeysets() crypto.KeysetsMap {
@@ -434,7 +472,11 @@ func (db *BoltDB) GetKeyset(keysetId string) *crypto.WalletKeyset {
 func (db *BoltDB) IncrementKeysetCounter(keysetId string, num uint32) error {
 	if err := db.bolt.Update(func(tx *bolt.Tx) error {
 		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
-		var keyset *crypto.WalletKeyset
+
+		// Copies of one keyset id under different mint-URL spellings can
+		// drift; increments derive from the highest copy and re-write every
+		// copy so the id again has a single counter value everywhere.
+		newCounter := maxKeysetCounterTx(keysetsb, keysetId) + num
 		keysetFound := false
 
 		err := keysetsb.ForEach(func(mintURL, v []byte) error {
@@ -442,13 +484,17 @@ func (db *BoltDB) IncrementKeysetCounter(keysetId string, num uint32) error {
 
 			keysetBytes := mintBucket.Get([]byte(keysetId))
 			if keysetBytes != nil {
-				err := json.Unmarshal(keysetBytes, &keyset)
-				if err != nil {
+				var keyset crypto.WalletKeyset
+				if err := json.Unmarshal(keysetBytes, &keyset); err != nil {
 					return fmt.Errorf("error reading keyset from db: %v", err)
 				}
-				keyset.Counter += num
+				keyset.Counter = newCounter
 
-				jsonBytes, err := json.Marshal(keyset)
+				// Marshal the pointer: WalletKeyset's custom JSON lives on
+				// the pointer receiver, and marshaling the value copies it
+				// into an interface where the custom encoding no longer
+				// applies — producing bytes UnmarshalJSON cannot read back.
+				jsonBytes, err := json.Marshal(&keyset)
 				if err != nil {
 					return err
 				}
@@ -476,35 +522,39 @@ func (db *BoltDB) GetKeysetCounter(keysetId string) uint32 {
 
 	if err := db.bolt.Update(func(tx *bolt.Tx) error {
 		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
-		var keyset *crypto.WalletKeyset
-		keysetFound := false
 
-		err := keysetsb.ForEach(func(mintURL, v []byte) error {
-			mintBucket := keysetsb.Bucket(mintURL)
+		// The derivation base is the highest counter stored for this id:
+		// copies under different mint-URL spellings may differ, and any
+		// lower value would re-derive outputs the mint has already signed.
+		counter = maxKeysetCounterTx(keysetsb, keysetId)
 
-			keysetBytes := mintBucket.Get([]byte(keysetId))
-			if keysetBytes != nil {
-				err := json.Unmarshal(keysetBytes, &keyset)
-				if err != nil {
-					return err
-				}
-				counter = keyset.Counter
-				keysetFound = true
-				return nil
+		if counter == 0 {
+			// Distinguish "exists at 0" from "does not exist" — the
+			// original semantics returned an error for the latter.
+			if !keysetExistsTx(keysetsb, keysetId) {
+				return errors.New("keyset does not exist")
 			}
-			return nil
-		})
-
-		if !keysetFound {
-			return errors.New("keyset does not exist")
 		}
 
-		return err
+		return nil
 	}); err != nil {
 		return 0
 	}
 
 	return counter
+}
+
+// keysetExistsTx reports whether any mint-URL bucket holds keysetId.
+func keysetExistsTx(keysetsb *bolt.Bucket, keysetId string) bool {
+	found := false
+	_ = keysetsb.ForEach(func(mintURL, _ []byte) error {
+		mintBucket := keysetsb.Bucket(mintURL)
+		if mintBucket != nil && mintBucket.Get([]byte(keysetId)) != nil {
+			found = true
+		}
+		return nil
+	})
+	return found
 }
 
 // UpdateKeysetMintURL creates a new bucket named with newURL. It will then
