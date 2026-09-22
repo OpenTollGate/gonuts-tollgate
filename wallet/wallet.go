@@ -2262,31 +2262,50 @@ func (w *Wallet) ReclaimUnspentProofs() (uint64, error) {
 		}
 
 		if len(proofsToReclaim) > 0 {
-			mint := w.mints[mintURL]
-			req, err := w.createSwapRequest(proofsToReclaim, &mint)
+			amount, err := w.swapBackUnspentProofs(mintURL, proofsToReclaim, pendingYsToDelete)
 			if err != nil {
-				return 0, fmt.Errorf("could not create swap request: %w", err)
+				return 0, err
 			}
-			err = w.db.IncrementKeysetCounter(req.keyset.Id, uint32(len(req.outputs)))
-			if err != nil {
-				return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
-			}
-			newProofs, err := swap(mintURL, req)
-			if err != nil {
-				return 0, fmt.Errorf("could not swap proofs: %w", err)
-			}
-			if err := w.db.SaveProofs(newProofs); err != nil {
-				return 0, fmt.Errorf("error storing proofs: %w", err)
-			}
-			if err := w.db.DeletePendingProofs(pendingYsToDelete); err != nil {
-				return 0, fmt.Errorf("error removing pending proofs: %w", err)
-			}
-
-			amountReclaimed = newProofs.Amount()
+			amountReclaimed = amount
 		}
 	}
 
 	return amountReclaimed, nil
+}
+
+// swapBackUnspentProofs re-swaps mint-confirmed-unspent pending proofs
+// back into spendable proofs. It holds w.mu across derive→increment→swap
+// →save so a concurrent Receive/Melt/Send cannot interleave derivation
+// from the same keyset counter (the reserve-before-expose invariant is
+// per-operation, and the ranges must not interleave unsynchronized).
+func (w *Wallet) swapBackUnspentProofs(mintURL string, proofsToReclaim cashu.Proofs, pendingYsToDelete []string) (uint64, error) {
+	mint, ok := w.mints[mintURL]
+	if !ok {
+		return 0, fmt.Errorf("mint %s has pending proofs but is not registered in this wallet", mintURL)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	req, err := w.createSwapRequest(proofsToReclaim, &mint)
+	if err != nil {
+		return 0, fmt.Errorf("could not create swap request: %w", err)
+	}
+	if err = w.db.IncrementKeysetCounter(req.keyset.Id, uint32(len(req.outputs))); err != nil {
+		return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
+	}
+	newProofs, err := swap(mintURL, req)
+	if err != nil {
+		return 0, fmt.Errorf("could not swap proofs: %w", err)
+	}
+	if err := w.db.SaveProofs(newProofs); err != nil {
+		return 0, fmt.Errorf("error storing proofs: %w", err)
+	}
+	if err := w.db.DeletePendingProofs(pendingYsToDelete); err != nil {
+		return 0, fmt.Errorf("error removing pending proofs: %w", err)
+	}
+
+	return newProofs.Amount(), nil
 }
 
 // GetPendingMeltQuotes return a list of pending quote ids
