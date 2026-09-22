@@ -876,6 +876,12 @@ var swap = func(mint string, swapRequest swapRequestPayload) (cashu.Proofs, erro
 
 // swapWithRetry calls swap() and retries once with fresh blinded messages
 // if the mint returns a "blinded message already signed" error.
+//
+// The retry's derivation range must be persisted (counter incremented)
+// before it is sent, exactly like the first attempt: an unpersisted retry
+// range leaves the counter below the last exposed range, so every later
+// first attempt re-derives it and eats a guaranteed 10002 — and a crash
+// between retry-send and success would replay it after restart.
 func (w *Wallet) swapWithRetry(
 	mintURL string,
 	req swapRequestPayload,
@@ -887,17 +893,20 @@ func (w *Wallet) swapWithRetry(
 	if err != nil {
 		var cashuErr cashu.Error
 		if errors.As(err, &cashuErr) && cashuErr.Code == cashu.BlindedMessageAlreadySignedErrCode {
-			req, err = w.createSwapRequest(proofs, mint)
-			if err != nil {
-				return nil, fmt.Errorf("could not create retry swap request: %w", err)
+			retryReq, createErr := w.createSwapRequest(proofs, mint)
+			if createErr != nil {
+				return nil, fmt.Errorf("could not create retry swap request: %w", createErr)
 			}
 			if nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
-				req.outputs, err = nut11.AddSignatureToOutputs(req.outputs, w.privateKey)
+				retryReq.outputs, err = nut11.AddSignatureToOutputs(retryReq.outputs, w.privateKey)
 				if err != nil {
 					return nil, fmt.Errorf("error signing outputs on retry: %w", err)
 				}
 			}
-			return swap(mintURL, req)
+			if incErr := w.db.IncrementKeysetCounter(retryReq.keyset.Id, uint32(len(retryReq.outputs))); incErr != nil {
+				return nil, fmt.Errorf("error incrementing keyset counter for retry: %w", incErr)
+			}
+			return swap(mintURL, retryReq)
 		}
 		return nil, err
 	}
@@ -1005,7 +1014,11 @@ func (w *Wallet) CheckMeltQuoteState(quoteId string) (*nut05.PostMeltQuoteBolt11
 				return nil, fmt.Errorf("error removing pending proofs: %w", err)
 			}
 			change := len(quoteStateResponse.Change)
-			// increment the counter if there was change from this quote
+			// Increment for quotes whose melt range predates the
+			// reserve-before-send fix (their change outputs were exposed but
+			// never counter-reserved). For post-fix quotes the range is
+			// already reserved and this over-advances — the safe direction:
+			// the counter only ever moves past exposed ranges, never back.
 			if change > 0 {
 				if err := w.db.IncrementKeysetCounter(keysetId, uint32(change)); err != nil {
 					return nil, fmt.Errorf("error incrementing keyset counter: %w", err)
@@ -1107,6 +1120,16 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		return nil, fmt.Errorf("error generating blinded messages for change: %w", err)
 	}
 
+	// The blank outputs are exposed to the mint with this request, so their
+	// derivation range must be persisted BEFORE it is sent (the same
+	// reserve-before-expose invariant as Receive, #266). If the mint pays the
+	// invoice, returns fee change, and the response is lost, a later melt
+	// must never re-derive this range — the mint already signed it and will
+	// reject with "outputs already signed" (tollgate #494).
+	if err := w.db.IncrementKeysetCounter(activeKeyset.Id, uint32(len(outputs))); err != nil {
+		return nil, fmt.Errorf("error incrementing keyset counter: %w", err)
+	}
+
 	meltBolt11Request := nut05.PostMeltBolt11Request{
 		Quote:   quote.QuoteId,
 		Inputs:  proofs,
@@ -1160,9 +1183,10 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		}
 
 		change := len(meltBolt11Response.Change)
-		// if mint provided blind signtures for any overpaid lightning fees:
-		// - unblind them and save the proofs in the db
-		// - increment keyset counter in db (by the number of blind sigs provided by mint)
+		// if mint provided blind signtures for any overpaid lightning fees,
+		// unblind them and save the proofs in the db. No counter increment
+		// here: the whole blank-output range was already reserved before the
+		// request was sent, and the change signatures live inside it.
 		if change > 0 {
 			changeProofs, err := constructProofs(
 				meltBolt11Response.Change,
@@ -1176,9 +1200,6 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 			}
 			if err := w.db.SaveProofs(changeProofs); err != nil {
 				return nil, fmt.Errorf("error storing change proofs: %w", err)
-			}
-			if err := w.db.IncrementKeysetCounter(activeKeyset.Id, uint32(change)); err != nil {
-				return nil, fmt.Errorf("error incrementing keyset counter: %w", err)
 			}
 		}
 	}
