@@ -47,10 +47,9 @@ func TestSwapWithRetryReservesRetryRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("createSwapRequest: %v", err)
 	}
-	if err := w.db.IncrementKeysetCounter(v2FullID, uint32(len(req.outputs))); err != nil {
-		t.Fatalf("pre-increment: %v", err)
-	}
-	counterAfterFirst := w.counterForKeyset(v2FullID)
+	// swapWithIntent (inside swapWithRetry) now reserves the first
+	// attempt's range atomically with its intent — no manual pre-increment.
+	counterAfterFirst := req.counterStart + uint32(len(req.outputs))
 
 	firstOutputs := map[string]bool{}
 	for _, bm := range req.outputs {
@@ -71,7 +70,7 @@ func TestSwapWithRetryReservesRetryRange(t *testing.T) {
 	}
 	defer func() { swap = nil }()
 
-	got, err := w.swapWithRetry(srv.URL, req, proofs, &mint, nut10.WellKnownSecret{})
+	got, _, err := w.swapWithRetry(srv.URL, req, proofs, &mint, nut10.WellKnownSecret{})
 	if err != nil {
 		t.Fatalf("swapWithRetry: %v", err)
 	}
