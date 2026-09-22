@@ -21,6 +21,7 @@ const (
 	KEYSETS_BUCKET        = "keysets"
 	PROOFS_BUCKET         = "proofs"
 	PENDING_PROOFS_BUCKET = "pending_proofs"
+	PENDING_SWAPS_BUCKET  = "pending_swaps"
 	MINT_QUOTES_BUCKET    = "mint_quotes"
 	MELT_QUOTES_BUCKET    = "melt_quotes"
 	INVOICES_BUCKET       = "invoices"
@@ -215,6 +216,10 @@ func (db *BoltDB) initWalletBuckets() error {
 		}
 
 		_, err = tx.CreateBucketIfNotExists([]byte(PENDING_PROOFS_BUCKET))
+		if err != nil {
+			return err
+		}
+		_, err = tx.CreateBucketIfNotExists([]byte(PENDING_SWAPS_BUCKET))
 		if err != nil {
 			return err
 		}
@@ -658,6 +663,85 @@ func (db *BoltDB) IncrementKeysetCounter(keysetId string, num uint32) error {
 	}
 
 	return nil
+}
+
+// ReserveKeysetRangeWithIntent advances the keyset counter and stores
+// the swap intent in the same transaction: an intent always has its
+// reserved range, and an exposed range always has its intent. The
+// counter semantics match IncrementKeysetCounter exactly.
+func (db *BoltDB) ReserveKeysetRangeWithIntent(keysetId string, num uint32, intent *PendingSwapIntent) error {
+	if intent == nil {
+		return errors.New("intent must not be nil")
+	}
+	if err := db.bolt.Update(func(tx *bolt.Tx) error {
+		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
+		var keyset *crypto.WalletKeyset
+		keysetFound := false
+
+		err := keysetsb.ForEach(func(mintURL, v []byte) error {
+			mintBucket := keysetsb.Bucket(mintURL)
+
+			keysetBytes := mintBucket.Get([]byte(keysetId))
+			if keysetBytes != nil {
+				err := json.Unmarshal(keysetBytes, &keyset)
+				if err != nil {
+					return fmt.Errorf("error reading keyset from db: %v", err)
+				}
+				keyset.Counter += num
+
+				jsonBytes, err := json.Marshal(keyset)
+				if err != nil {
+					return err
+				}
+				keysetFound = true
+				return mintBucket.Put([]byte(keysetId), jsonBytes)
+			}
+
+			return nil
+		})
+
+		if !keysetFound {
+			return errors.New("keyset does not exist")
+		}
+		if err != nil {
+			return err
+		}
+
+		jsonIntent, err := json.Marshal(intent)
+		if err != nil {
+			return fmt.Errorf("invalid swap intent: %v", err)
+		}
+		return tx.Bucket([]byte(PENDING_SWAPS_BUCKET)).Put([]byte(intent.OpID), jsonIntent)
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (db *BoltDB) GetPendingSwaps() []*PendingSwapIntent {
+	intents := []*PendingSwapIntent{}
+	_ = db.bolt.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(PENDING_SWAPS_BUCKET))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(k, v []byte) error {
+			var intent PendingSwapIntent
+			if err := json.Unmarshal(v, &intent); err != nil {
+				return nil // skip corrupt entries, never abort recovery
+			}
+			intents = append(intents, &intent)
+			return nil
+		})
+	})
+	return intents
+}
+
+func (db *BoltDB) DeletePendingSwap(opId string) error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(PENDING_SWAPS_BUCKET)).Delete([]byte(opId))
+	})
 }
 
 func (db *BoltDB) GetKeysetCounter(keysetId string) uint32 {
