@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
@@ -45,6 +47,130 @@ var ErrDBLocked = errors.New("wallet database is locked")
 // before returning ErrDBLocked.
 const boltOpenTimeout = 5 * time.Second
 
+// canonicalMintURL returns the canonical bucket-key form of a mint URL:
+// scheme and host lowercased, default ports dropped, trailing slashes
+// stripped from the path. The wallet DB nests keyset records under buckets
+// keyed by the mint URL as passed; two spellings of one mint (with and
+// without a trailing slash — the cdk token form carries one) created two
+// divergent copies of each keyset's derivation counter, and a restart that
+// re-saved a fresh keyset under one alias replayed already-registered swap
+// outputs at the mint ("Duplicate outputs", #480 in tollgate-module-basic-go).
+// Every write keys by this canonical form so no new aliases can appear.
+func canonicalMintURL(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return strings.TrimSpace(raw)
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	if (u.Scheme == "http" && strings.HasSuffix(u.Host, ":80")) ||
+		(u.Scheme == "https" && strings.HasSuffix(u.Host, ":443")) {
+		u.Host = u.Host[:strings.LastIndex(u.Host, ":")]
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+// mergeMintURLAliases heals wallets written before canonicalization: for
+// every keyset id that exists under more than one mint-URL bucket spelling,
+// the copy with the HIGHEST derivation counter wins (the safe direction —
+// a lower counter would re-derive already-registered blinded messages),
+// all copies are rewritten under the canonical bucket, and alias buckets
+// are deleted. Idempotent: a canonical DB is rewritten to itself.
+func (db *BoltDB) mergeMintURLAliases() error {
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
+		if keysetsb == nil {
+			return nil
+		}
+
+		type best struct {
+			json    []byte
+			counter uint32
+		}
+		winners := map[string]*best{} // keyset id -> surviving record
+
+		if err := keysetsb.ForEach(func(mintURL, _ []byte) error {
+			mintBucket := keysetsb.Bucket(mintURL)
+			if mintBucket == nil {
+				return nil
+			}
+			return mintBucket.ForEach(func(id, v []byte) error {
+				if v == nil {
+					return nil
+				}
+				var ks crypto.WalletKeyset
+				if err := json.Unmarshal(v, &ks); err != nil {
+					return nil // not a keyset record; leave it alone
+				}
+				w, ok := winners[ks.Id]
+				if !ok || ks.Counter > w.counter {
+					cp := make([]byte, len(v))
+					copy(cp, v)
+					winners[ks.Id] = &best{json: cp, counter: ks.Counter}
+				}
+				return nil
+			})
+		}); err != nil {
+			return err
+		}
+
+		// delete every non-canonical mint bucket
+		var toDelete [][]byte
+		if err := keysetsb.ForEach(func(mintURL, _ []byte) error {
+			if string(mintURL) != canonicalMintURL(string(mintURL)) {
+				toDelete = append(toDelete, append([]byte(nil), mintURL...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, m := range toDelete {
+			if err := keysetsb.DeleteBucket(m); err != nil && err != bolt.ErrBucketNotFound {
+				return err
+			}
+		}
+
+		// rewrite winners under their canonical bucket, dropping empty
+		// canonical buckets of aliases along the way
+		for _, w := range winners {
+			var ks crypto.WalletKeyset
+			if err := json.Unmarshal(w.json, &ks); err != nil {
+				continue
+			}
+			bucketName := canonicalMintURL(ks.MintURL)
+			mintBucket, err := keysetsb.CreateBucketIfNotExists([]byte(bucketName))
+			if err != nil {
+				return err
+			}
+			if err := mintBucket.Put([]byte(ks.Id), w.json); err != nil {
+				return err
+			}
+		}
+
+		// remove canonical buckets left empty by the rewrite
+		var empty [][]byte
+		if err := keysetsb.ForEach(func(mintURL, _ []byte) error {
+			b := keysetsb.Bucket(mintURL)
+			if b != nil && b.Stats().KeyN == 0 {
+				empty = append(empty, append([]byte(nil), mintURL...))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, m := range empty {
+			if err := keysetsb.DeleteBucket(m); err != nil && err != bolt.ErrBucketNotFound {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func InitBolt(path string) (*BoltDB, error) {
 	db, err := bolt.Open(filepath.Join(path, "wallet.db"), 0600, &bolt.Options{Timeout: boltOpenTimeout})
 	if err != nil {
@@ -63,6 +189,10 @@ func InitBolt(path string) (*BoltDB, error) {
 
 	if err := boltdb.MigrateInvoicesToQuotes(); err != nil {
 		return nil, fmt.Errorf("error migrating db: %v", err)
+	}
+
+	if err := boltdb.mergeMintURLAliases(); err != nil {
+		return nil, fmt.Errorf("error merging mint-url alias buckets: %v", err)
 	}
 
 	return boltdb, nil
@@ -370,15 +500,74 @@ func (db *BoltDB) SaveKeyset(keyset *crypto.WalletKeyset) error {
 
 	if err := db.bolt.Update(func(tx *bolt.Tx) error {
 		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
-		mintBucket, err := keysetsb.CreateBucketIfNotExists([]byte(keyset.MintURL))
+		mintBucket, err := keysetsb.CreateBucketIfNotExists([]byte(canonicalMintURL(keyset.MintURL)))
 		if err != nil {
 			return err
+		}
+		// The derivation counter is monotonic: it names output indices the
+		// mint may already have registered. Writers re-fetching a keyset from
+		// its mint construct a fresh record (Counter 0) — e.g. the restart
+		// path's AddMint — and saving that unconditionally rewound the
+		// counter, so post-restart swaps re-derived already-signed blinded
+		// messages ("Duplicate outputs", tollgate #480). Never lower a
+		// persisted counter on write.
+		if existing := mintBucket.Get([]byte(keyset.Id)); existing != nil {
+			var prev crypto.WalletKeyset
+			if err := json.Unmarshal(existing, &prev); err == nil && prev.Counter > keyset.Counter {
+				keyset.Counter = prev.Counter
+				jsonKeyset, err = json.Marshal(keyset)
+				if err != nil {
+					return fmt.Errorf("invalid keyset format: %v", err)
+				}
+			}
 		}
 		return mintBucket.Put([]byte(keyset.Id), jsonKeyset)
 	}); err != nil {
 		return fmt.Errorf("error saving keyset: %v", err)
 	}
 	return nil
+}
+
+// saveKeysetRaw writes a keyset record under an arbitrary bucket key,
+// emulating the pre-canonicalization writer so tests can seed legacy alias
+// buckets exactly as old wallets had them.
+// SaveKeysetRawForTests writes a keyset under an arbitrary bucket key,
+// emulating the pre-canonicalization writer (exported for cross-package
+// tests that seed legacy alias buckets).
+func (db *BoltDB) SaveKeysetRawForTests(bucketKey string, keyset *crypto.WalletKeyset) error {
+	return db.saveKeysetRaw(bucketKey, keyset)
+}
+
+// mintBucketNames lists the mint-URL bucket keys under the keysets bucket
+// (test/diagnostic helper).
+func (db *BoltDB) mintBucketNames() []string {
+	var names []string
+	db.bolt.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte(KEYSETS_BUCKET))
+		if b == nil {
+			return nil
+		}
+		return b.ForEach(func(mintURL, _ []byte) error {
+			names = append(names, string(mintURL))
+			return nil
+		})
+	})
+	return names
+}
+
+func (db *BoltDB) saveKeysetRaw(bucketKey string, keyset *crypto.WalletKeyset) error {
+	jsonKeyset, err := json.Marshal(keyset)
+	if err != nil {
+		return err
+	}
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
+		mintBucket, err := keysetsb.CreateBucketIfNotExists([]byte(bucketKey))
+		if err != nil {
+			return err
+		}
+		return mintBucket.Put([]byte(keyset.Id), jsonKeyset)
+	})
 }
 
 func (db *BoltDB) GetKeysets() crypto.KeysetsMap {
