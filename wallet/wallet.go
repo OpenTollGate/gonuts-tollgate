@@ -240,6 +240,32 @@ func (w *Wallet) PendingBalance() uint64 {
 	return amount(w.db.GetPendingProofs())
 }
 
+// KeysetFeesForMint returns keyset-id -> InputFeePpk for every keyset of
+// the mint currently held in the wallet's in-memory cache (active and
+// inactive), with no network traffic. It exists so callers on the payment
+// hot path (fee pre-checks) do not ride the HTTP retry ladder against a
+// slow or wedged mint (tollgate-module-basic-go #525): the fee data is
+// already durable in the wallet DB and warm after boot. The mint must
+// have been registered (AddMint / accepted-mints at construction); an
+// unknown mint is an error so the caller can fall back to a fetch.
+func (w *Wallet) KeysetFeesForMint(mintURL string) (map[string]uint, error) {
+	url, err := url.Parse(mintURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid mint url: %w", err)
+	}
+	mint, ok := w.mints[url.String()]
+	if !ok {
+		return nil, fmt.Errorf("mint %s is not registered in this wallet", url.String())
+	}
+
+	fees := make(map[string]uint, len(mint.inactiveKeysets)+1)
+	fees[mint.activeKeyset.Id] = mint.activeKeyset.InputFeePpk
+	for id, keyset := range mint.inactiveKeysets {
+		fees[id] = keyset.InputFeePpk
+	}
+	return fees, nil
+}
+
 func amount(proofs []storage.DBProof) uint64 {
 	var totalAmount uint64 = 0
 	for _, proof := range proofs {
