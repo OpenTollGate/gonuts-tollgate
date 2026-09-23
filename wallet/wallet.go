@@ -402,7 +402,25 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 	}
 	mintResponse, err := client.PostMintBolt11(mint, postMintRequest)
 	if err != nil {
-		return 0, err
+		// cdk mints through 0.17.x verify only the pre-amendment NUT-20
+		// message, so the amended-spec signature above is rejected with
+		// 20008 even though it is spec-correct. A mint request burns no
+		// inputs and is idempotent on the quote, so one retry with the
+		// legacy signature is safe (the same transition cashu-ts ships).
+		var cashuErr cashu.Error
+		if errors.As(err, &cashuErr) && cashuErr.Code == cashu.MintQuoteInvalidSigErrCode {
+			if quote.PrivateKey != nil {
+				legacySig, signErr := nut20.SignMintQuoteLegacy(quote.PrivateKey, quoteId, blindedMessages)
+				if signErr != nil {
+					return 0, fmt.Errorf("could not sign legacy mint quote: %w", signErr)
+				}
+				postMintRequest.Signature = hex.EncodeToString(legacySig.Serialize())
+				mintResponse, err = client.PostMintBolt11(mint, postMintRequest)
+			}
+		}
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	// unblind the signatures from the promises and build the proofs
