@@ -402,7 +402,19 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 		Outputs:   blindedMessages,
 		Signature: signature,
 	}
-	mintResponse, err := client.PostMintBolt11(mint, postMintRequest)
+
+	// Persist the mint intent atomically with the counter reservation
+	// BEFORE the POST — the #497 invariant, extended to mints: a crash
+	// after the mint signed but before SaveProofs must leave the exact
+	// request bytes (whichever NUT-20 signature form ends up on the
+	// wire) for ResumePendingOperations to replay.
+	opID := newSwapOpID()
+	intent := mintIntent(opID, mint, activeKeyset.Id, counter, &postMintRequest, blindedMessages, secrets, rs)
+	if err := w.db.ReserveKeysetRangeWithIntent(activeKeyset.Id, uint32(len(blindedMessages)), intent); err != nil {
+		return 0, fmt.Errorf("could not reserve range with mint intent: %w", err)
+	}
+
+	mintResponse, err := postMintBolt11(mint, postMintRequest)
 	if err != nil {
 		// cdk mints through 0.17.x verify only the pre-amendment NUT-20
 		// message, so the amended-spec signature above is rejected with
@@ -417,10 +429,16 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 					return 0, fmt.Errorf("could not sign legacy mint quote: %w", signErr)
 				}
 				postMintRequest.Signature = hex.EncodeToString(legacySig.Serialize())
-				mintResponse, err = client.PostMintBolt11(mint, postMintRequest)
+				intent.RequestBytes = mustMarshalMintRequest(postMintRequest)
+				if err := w.db.PutPendingSwap(intent); err != nil {
+					log.Printf("wallet: could not update mint intent %s for retry: %v", opID, err)
+				}
+				mintResponse, err = postMintBolt11(mint, postMintRequest)
 			}
 		}
 		if err != nil {
+			// The intent deliberately remains: the mint may have signed
+			// before the error surfaced; resume decides by replay.
 			return 0, err
 		}
 	}
@@ -434,6 +452,11 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 	// store proofs in db
 	if err := w.db.SaveProofs(proofs); err != nil {
 		return 0, fmt.Errorf("error storing proofs: %w", err)
+	}
+	if err := w.db.DeletePendingSwap(opID); err != nil {
+		// Proofs are durable; a lingering intent only costs an
+		// idempotent replay at the next resume.
+		log.Printf("wallet: could not delete mint intent %s after save: %v", opID, err)
 	}
 
 	// only increase counter if mint was successful
@@ -872,6 +895,10 @@ func (w *Wallet) createSwapRequest(proofs cashu.Proofs, mint *walletMint) (swapR
 	}, nil
 }
 
+// postMintBolt11 is declared as a variable so tests can override it
+// (the mint-side crash-window tests intercept between POST and save).
+var postMintBolt11 = client.PostMintBolt11
+
 // swap is declared as a variable so tests can override it.
 var swap = func(mint string, swapRequest swapRequestPayload) (cashu.Proofs, error) {
 	// NUT #03: These are then used by the wallet to generate new `Proofs`
@@ -944,6 +971,7 @@ func (w *Wallet) swapWithIntent(mintURL string, req swapRequestPayload) (cashu.P
 		Outputs:      req.outputs,
 		Secrets:      req.secrets,
 		Rs:           rs,
+		OpType:       storage.PendingOpSwap,
 	}
 	if err := w.db.ReserveKeysetRangeWithIntent(req.keyset.Id, uint32(len(req.outputs)), intent); err != nil {
 		return nil, "", fmt.Errorf("could not reserve range with intent: %w", err)

@@ -54,6 +54,7 @@ type WalletDB interface {
 	// range can never be exposed without its intent (#497).
 	ReserveKeysetRangeWithIntent(keysetId string, num uint32, intent *PendingSwapIntent) error
 	GetPendingSwaps() []*PendingSwapIntent
+	PutPendingSwap(intent *PendingSwapIntent) error
 	DeletePendingSwap(opId string) error
 	GetKeysets() crypto.KeysetsMap
 	GetKeyset(string) *crypto.WalletKeyset
@@ -106,7 +107,18 @@ type PendingSwapIntent struct {
 	Secrets []string
 	// Rs are the serialized blinding factors (secp256k1 private keys).
 	Rs [][]byte
+	// OpType routes the resume path; empty means a swap (the first
+	// operation this machinery covered) so pre-existing records stay
+	// valid.
+	OpType string
 }
+
+const (
+	// PendingOpSwap is a /v1/swap replay.
+	PendingOpSwap = "swap"
+	// PendingOpMint is a /v1/mint/bolt11 replay.
+	PendingOpMint = "mint"
+)
 
 type MintQuote struct {
 	QuoteId        string
