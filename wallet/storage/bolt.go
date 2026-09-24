@@ -719,6 +719,23 @@ func (db *BoltDB) ReserveKeysetRangeWithIntent(keysetId string, num uint32, inte
 	return nil
 }
 
+// PutPendingSwap overwrites an existing intent by its OpID without
+// touching counters — used when a retry re-signs the same derivation
+// range (e.g. the NUT-20 legacy-signature retry) and the persisted
+// request bytes must follow the bytes actually sent.
+func (db *BoltDB) PutPendingSwap(intent *PendingSwapIntent) error {
+	if intent == nil {
+		return errors.New("intent must not be nil")
+	}
+	jsonIntent, err := json.Marshal(intent)
+	if err != nil {
+		return fmt.Errorf("invalid swap intent: %v", err)
+	}
+	return db.bolt.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte(PENDING_SWAPS_BUCKET)).Put([]byte(intent.OpID), jsonIntent)
+	})
+}
+
 func (db *BoltDB) GetPendingSwaps() []*PendingSwapIntent {
 	intents := []*PendingSwapIntent{}
 	_ = db.bolt.View(func(tx *bolt.Tx) error {

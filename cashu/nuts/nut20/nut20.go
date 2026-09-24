@@ -57,6 +57,34 @@ func canonicalAmountBytes(amount uint64) []byte {
 	return buf[:]
 }
 
+// buildLegacyMessageToSign constructs the pre-amendment NUT-20 message:
+// the UTF-8 quote id concatenated with each output's B_ hex string, in
+// request order. cdk mints through 0.17.x verify only this form; the
+// amended spec's domain-separated format is the primary, this is the
+// fallback (cashu-ts ships the same pair for the same reason).
+func buildLegacyMessageToSign(quoteId string, blindedMessages cashu.BlindedMessages) []byte {
+	msg := []byte(quoteId)
+	for _, bm := range blindedMessages {
+		msg = append(msg, []byte(bm.B_)...)
+	}
+	return msg
+}
+
+// SignMintQuoteLegacy signs the pre-amendment message — the retry
+// signature for mints that reject the amended one with 20008.
+func SignMintQuoteLegacy(
+	privateKey *secp256k1.PrivateKey,
+	quoteId string,
+	blindedMessages cashu.BlindedMessages,
+) (*schnorr.Signature, error) {
+	hash := sha256.Sum256(buildLegacyMessageToSign(quoteId, blindedMessages))
+	sig, err := schnorr.Sign(privateKey, hash[:])
+	if err != nil {
+		return nil, err
+	}
+	return sig, nil
+}
+
 func SignMintQuote(
 	privateKey *secp256k1.PrivateKey,
 	quoteId string,

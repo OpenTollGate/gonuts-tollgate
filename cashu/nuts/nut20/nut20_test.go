@@ -1,6 +1,7 @@
 package nut20
 
 import (
+	"bytes"
 	"encoding/hex"
 	"testing"
 
@@ -127,5 +128,30 @@ func TestCanonicalAmountBytes(t *testing.T) {
 		if len(got) != tt.want {
 			t.Errorf("canonicalAmountBytes(%d) length = %d, want %d", tt.amount, len(got), tt.want)
 		}
+	}
+}
+
+// The legacy message is the pre-amendment concatenation the deployed
+// cdk ecosystem verifies: quote id + each B_ hex string, nothing else.
+func TestLegacyMessageMatchesCdkFormat(t *testing.T) {
+	bms := cashu.BlindedMessages{
+		{Amount: 8, B_: "035015e6d7ade60ba8426cefaf1832bbd27357636e44a76b922d78e79b47cb689d"},
+		{Amount: 2, B_: "0288d7649652d0a83fc9c966c969fb217f15904431e61a44b14999fabc1b5d9ac6"},
+	}
+	quote := "9d745270-1405-46de-b5c5-e2762b4f5e00"
+	got := buildLegacyMessageToSign(quote, bms)
+	want := []byte(quote + bms[0].B_ + bms[1].B_)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("legacy message mismatch:\n got %x\nwant %x", got, want)
+	}
+}
+
+// The two formats must differ for the same inputs — otherwise the
+// fallback would be a no-op.
+func TestLegacyAndAmendedMessagesDiffer(t *testing.T) {
+	bms := cashu.BlindedMessages{{Amount: 1, B_: "02ab"}}
+	quote := "q"
+	if bytes.Equal(buildLegacyMessageToSign(quote, bms), buildMessageToSign(quote, bms)) {
+		t.Fatal("legacy and amended messages must differ")
 	}
 }
