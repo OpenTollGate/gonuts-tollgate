@@ -13,6 +13,7 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut03"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut20"
 	"github.com/OpenTollGate/gonuts-tollgate/wallet/storage"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -66,6 +67,8 @@ func (w *Wallet) resumeOneOperation(intent *storage.PendingSwapIntent) (uint64, 
 	switch intent.OpType {
 	case storage.PendingOpMint:
 		return w.resumeOneMint(intent)
+	case storage.PendingOpMelt:
+		return w.resumeOneMelt(intent)
 	default:
 		// empty OpType = the original swap records
 		return w.resumeOneSwap(intent)
@@ -120,6 +123,46 @@ func (w *Wallet) resumeOneMint(intent *storage.PendingSwapIntent) (uint64, error
 		return 0, fmt.Errorf("could not parse replay response: %w", err)
 	}
 	return w.finishResume(intent, mintResponse.Signatures)
+}
+
+// resumeOneMelt replays a /v1/melt/bolt11 request. cdk-mintd replays
+// melts idempotently — a paid quote re-POSTed with identical bytes
+// returns state PAID with the same change signatures (verified live) —
+// so the persisted factors recover the change exactly as in swaps.
+func (w *Wallet) resumeOneMelt(intent *storage.PendingSwapIntent) (uint64, error) {
+	url := intent.MintURL
+	if len(url) == 0 || url[len(url)-1] != '/' {
+		url += "/"
+	}
+	resp, err := resumeHTTP.Post(url+"v1/melt/bolt11", "application/json", bytes.NewReader(intent.RequestBytes))
+	if err != nil {
+		return 0, err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if readErr != nil {
+		return 0, readErr
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("mint answered melt replay with HTTP %d: %s", resp.StatusCode, truncateForLog(body, 200))
+	}
+	var meltResponse nut05.PostMeltQuoteBolt11Response
+	if err := json.Unmarshal(body, &meltResponse); err != nil {
+		return 0, fmt.Errorf("could not parse melt replay response: %w", err)
+	}
+	if meltResponse.State != nut05.Paid {
+		return 0, fmt.Errorf("melt replay state %v, not PAID", meltResponse.State)
+	}
+	// The change signatures are the recovery target; an empty change
+	// (no fee overpayment) carries no value, so success with nothing to
+	// unblind is a clean completion.
+	if len(meltResponse.Change) == 0 {
+		if err := w.db.DeletePendingSwap(intent.OpID); err != nil {
+			return 0, fmt.Errorf("melt recovered (no change) but intent %s not deleted: %w", intent.OpID, err)
+		}
+		return 0, nil
+	}
+	return w.finishResume(intent, meltResponse.Change)
 }
 
 func (w *Wallet) retryMintReplayWithLegacySig(intent *storage.PendingSwapIntent) (*http.Response, error) {
@@ -219,7 +262,26 @@ func truncateForLog(b []byte, n int) string {
 // mintIntent builds the pending-op record for a /v1/mint/bolt11 POST.
 // OpType routes the resume path; RequestBytes are the exact bytes to
 // re-POST, including whichever NUT-20 signature form is on the wire.
-func mintIntent(opID, mintURL, keysetID string, counterStart uint32, req *nut04.PostMintBolt11Request, outputs cashu.BlindedMessages, secrets []string, rs []*secp256k1.PrivateKey) *storage.PendingSwapIntent {
+func mintIntent(opID, mintURL, keysetID string, counterStart uint32, req nut04.PostMintBolt11Request, outputs cashu.BlindedMessages, secrets []string, rs []*secp256k1.PrivateKey) *storage.PendingSwapIntent {
+	requestBytes, err := json.Marshal(req)
+	if err != nil {
+		panic(fmt.Sprintf("marshal mint request: %v", err))
+	}
+	return baseIntent(opID, mintURL, keysetID, counterStart, requestBytes, outputs, secrets, rs, storage.PendingOpMint)
+}
+
+// meltIntent builds the pending-op record for a /v1/melt/bolt11 POST:
+// the recovery target is the NUT-08 change, and the mint replays the
+// melt idempotently (state PAID with the same change signatures).
+func meltIntent(opID, mintURL, keysetID string, counterStart uint32, req nut05.PostMeltBolt11Request, outputs cashu.BlindedMessages, secrets []string, rs []*secp256k1.PrivateKey) *storage.PendingSwapIntent {
+	requestBytes, err := json.Marshal(req)
+	if err != nil {
+		panic(fmt.Sprintf("marshal melt request: %v", err))
+	}
+	return baseIntent(opID, mintURL, keysetID, counterStart, requestBytes, outputs, secrets, rs, storage.PendingOpMelt)
+}
+
+func baseIntent(opID, mintURL, keysetID string, counterStart uint32, requestBytes []byte, outputs cashu.BlindedMessages, secrets []string, rs []*secp256k1.PrivateKey, opType string) *storage.PendingSwapIntent {
 	serRs := make([][]byte, len(rs))
 	for i, r := range rs {
 		serRs[i] = r.Serialize()
@@ -230,11 +292,11 @@ func mintIntent(opID, mintURL, keysetID string, counterStart uint32, req *nut04.
 		KeysetID:     keysetID,
 		CounterStart: counterStart,
 		CounterEnd:   counterStart + uint32(len(outputs)),
-		RequestBytes: mustMarshalMintRequest(*req),
+		RequestBytes: requestBytes,
 		Outputs:      outputs,
 		Secrets:      secrets,
 		Rs:           serRs,
-		OpType:       storage.PendingOpMint,
+		OpType:       opType,
 	}
 }
 

@@ -118,6 +118,9 @@ const (
 	PendingOpSwap = "swap"
 	// PendingOpMint is a /v1/mint/bolt11 replay.
 	PendingOpMint = "mint"
+	// PendingOpMelt is a /v1/melt/bolt11 replay (recovery target: the
+	// NUT-08 change).
+	PendingOpMelt = "melt"
 )
 
 type MintQuote struct {
