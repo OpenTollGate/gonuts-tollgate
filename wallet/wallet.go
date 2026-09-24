@@ -4,8 +4,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"net/url"
 	"os"
@@ -736,17 +738,18 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 		w.mu.Lock()
 		defer w.mu.Unlock()
 
-		if err = w.db.IncrementKeysetCounter(req.keyset.Id, uint32(len(req.outputs))); err != nil {
-			return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
-		}
-
-		newProofs, err := w.swapWithRetry(tokenMint, req, proofsToSwap, &mint, nut10Secret)
+		newProofs, opID, err := w.swapWithRetry(tokenMint, req, proofsToSwap, &mint, nut10Secret)
 		if err != nil {
 			return 0, fmt.Errorf("could not swap proofs: %w", err)
 		}
 
 		if err := w.db.SaveProofs(newProofs); err != nil {
 			return 0, fmt.Errorf("error storing proofs: %w", err)
+		}
+		if err := w.db.DeletePendingSwap(opID); err != nil {
+			// The proofs are durable; a lingering intent only costs a
+			// redundant (idempotent) replay at the next resume.
+			log.Printf("wallet: could not delete pending swap %s after save: %v", opID, err)
 		}
 		return newProofs.Amount(), nil
 	}
@@ -809,18 +812,16 @@ func (w *Wallet) ReceiveHTLC(token cashu.Token, preimage string) (uint64, error)
 			}
 		}
 
-		err = w.db.IncrementKeysetCounter(req.keyset.Id, uint32(len(req.outputs)))
-		if err != nil {
-			return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
-		}
-
-		newProofs, err := w.swapWithRetry(tokenMint, req, proofs, &mint, nut10Secret)
+		newProofs, opID, err := w.swapWithRetry(tokenMint, req, proofs, &mint, nut10Secret)
 		if err != nil {
 			return 0, fmt.Errorf("could not swap proofs: %w", err)
 		}
 
 		if err := w.db.SaveProofs(newProofs); err != nil {
 			return 0, fmt.Errorf("error storing proofs: %w", err)
+		}
+		if err := w.db.DeletePendingSwap(opID); err != nil {
+			log.Printf("wallet: could not delete pending swap %s after save: %v", opID, err)
 		}
 		return newProofs.Amount(), nil
 	}
@@ -835,10 +836,15 @@ type swapRequestPayload struct {
 	rs      []*secp256k1.PrivateKey
 	// keyset to be used to unblind signatures after swap
 	keyset *crypto.WalletKeyset
+	// counterStart is the derivation base the outputs were built from:
+	// [counterStart, counterStart+len(outputs)) is the range this
+	// request exposes, recorded in its pending-swap intent (#497).
+	counterStart uint32
 }
 
 func (w *Wallet) createSwapRequest(proofs cashu.Proofs, mint *walletMint) (swapRequestPayload, error) {
 	keysetCounter := w.counterForKeyset(mint.activeKeyset.Id)
+	counterStart := keysetCounter
 
 	fees := feesForProofs(proofs, mint)
 	total := proofs.Amount()
@@ -857,11 +863,12 @@ func (w *Wallet) createSwapRequest(proofs cashu.Proofs, mint *walletMint) (swapR
 	}
 
 	return swapRequestPayload{
-		inputs:  proofs,
-		outputs: outputs,
-		secrets: secrets,
-		rs:      rs,
-		keyset:  &mint.activeKeyset,
+		inputs:       proofs,
+		outputs:      outputs,
+		secrets:      secrets,
+		rs:           rs,
+		keyset:       &mint.activeKeyset,
+		counterStart: counterStart,
 	}, nil
 }
 
@@ -900,35 +907,79 @@ var swap = func(mint string, swapRequest swapRequestPayload) (cashu.Proofs, erro
 // range leaves the counter below the last exposed range, so every later
 // first attempt re-derives it and eats a guaranteed 10002 — and a crash
 // between retry-send and success would replay it after restart.
+func newSwapOpID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failing is process-fatal territory; a time-based
+		// fallback keeps the op id unique within any realistic window.
+		return fmt.Sprintf("swap-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// swapWithIntent reserves the request's derivation range and records its
+// pending-swap intent in one transaction, then POSTs. On error the
+// intent deliberately REMAINS: the mint may have consumed the inputs,
+// and ResumePendingSwaps decides by replay. On success the caller owns
+// deleting the returned op id once the proofs are saved.
+func (w *Wallet) swapWithIntent(mintURL string, req swapRequestPayload) (cashu.Proofs, string, error) {
+	requestBytes, err := json.Marshal(nut03.PostSwapRequest{Inputs: req.inputs, Outputs: req.outputs})
+	if err != nil {
+		return nil, "", fmt.Errorf("could not marshal swap request: %w", err)
+	}
+
+	rs := make([][]byte, len(req.rs))
+	for i, r := range req.rs {
+		rs[i] = r.Serialize()
+	}
+
+	opID := newSwapOpID()
+	intent := &storage.PendingSwapIntent{
+		OpID:         opID,
+		MintURL:      mintURL,
+		KeysetID:     req.keyset.Id,
+		CounterStart: req.counterStart,
+		CounterEnd:   req.counterStart + uint32(len(req.outputs)),
+		RequestBytes: requestBytes,
+		Outputs:      req.outputs,
+		Secrets:      req.secrets,
+		Rs:           rs,
+	}
+	if err := w.db.ReserveKeysetRangeWithIntent(req.keyset.Id, uint32(len(req.outputs)), intent); err != nil {
+		return nil, "", fmt.Errorf("could not reserve range with intent: %w", err)
+	}
+
+	proofs, err := swap(mintURL, req)
+	return proofs, opID, err
+}
+
 func (w *Wallet) swapWithRetry(
 	mintURL string,
 	req swapRequestPayload,
 	proofs cashu.Proofs,
 	mint *walletMint,
 	nut10Secret nut10.WellKnownSecret,
-) (cashu.Proofs, error) {
-	newProofs, err := swap(mintURL, req)
+) (cashu.Proofs, string, error) {
+	newProofs, opID, err := w.swapWithIntent(mintURL, req)
 	if err != nil {
 		var cashuErr cashu.Error
 		if errors.As(err, &cashuErr) && cashuErr.Code == cashu.BlindedMessageAlreadySignedErrCode {
 			retryReq, createErr := w.createSwapRequest(proofs, mint)
 			if createErr != nil {
-				return nil, fmt.Errorf("could not create retry swap request: %w", createErr)
+				return nil, "", fmt.Errorf("could not create retry swap request: %w", createErr)
 			}
 			if nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
 				retryReq.outputs, err = nut11.AddSignatureToOutputs(retryReq.outputs, w.privateKey)
 				if err != nil {
-					return nil, fmt.Errorf("error signing outputs on retry: %w", err)
+					return nil, "", fmt.Errorf("error signing outputs on retry: %w", err)
 				}
 			}
-			if incErr := w.db.IncrementKeysetCounter(retryReq.keyset.Id, uint32(len(retryReq.outputs))); incErr != nil {
-				return nil, fmt.Errorf("error incrementing keyset counter for retry: %w", incErr)
-			}
-			return swap(mintURL, retryReq)
+			newProofs, retryOpID, err := w.swapWithIntent(mintURL, retryReq)
+			return newProofs, retryOpID, err
 		}
-		return nil, err
+		return nil, opID, err
 	}
-	return newProofs, nil
+	return newProofs, opID, nil
 }
 
 // swapToTrusted will swap the proofs from mint

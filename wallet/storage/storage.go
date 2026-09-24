@@ -46,6 +46,15 @@ type WalletDB interface {
 	DeletePendingProofsByQuoteId(string) error
 
 	SaveKeyset(*crypto.WalletKeyset) error
+
+	// ReserveKeysetRangeWithIntent advances the keyset's derivation
+	// counter by num AND stores the pending-swap intent in ONE bolt
+	// transaction — the atomicity is the fund-safety invariant: an
+	// intent can never exist for a range that was not reserved, and a
+	// range can never be exposed without its intent (#497).
+	ReserveKeysetRangeWithIntent(keysetId string, num uint32, intent *PendingSwapIntent) error
+	GetPendingSwaps() []*PendingSwapIntent
+	DeletePendingSwap(opId string) error
 	GetKeysets() crypto.KeysetsMap
 	GetKeyset(string) *crypto.WalletKeyset
 	IncrementKeysetCounter(string, uint32) error
@@ -72,6 +81,31 @@ type DBProof struct {
 	DLEQ   *cashu.DLEQProof `json:"dleq,omitempty"`
 	// set if pending proofs are tied to a melt quote
 	MeltQuoteId string `json:"quote_id"`
+}
+
+// PendingSwapIntent is the durable pre-POST record of a swap the wallet
+// is about to execute (or has executed without recording the outcome).
+// It exists so a crash between the mint accepting the swap and the
+// wallet saving the resulting proofs cannot destroy issued value: the
+// mint re-signs an identical swap deterministically, so re-POSTing
+// RequestBytes yields the same signatures, which the persisted Rs and
+// Secrets can unblind (tollgate-module-basic-go #497).
+type PendingSwapIntent struct {
+	OpID         string
+	MintURL      string
+	KeysetID     string
+	CounterStart uint32
+	// CounterEnd is exclusive: [CounterStart, CounterEnd) is the
+	// derivation range the request's outputs occupy.
+	CounterEnd uint32
+	// RequestBytes are the exact bytes to re-POST to {MintURL}/v1/swap.
+	RequestBytes []byte
+	// Outputs, Secrets and Rs reconstruct the proofs from the replayed
+	// signatures.
+	Outputs cashu.BlindedMessages
+	Secrets []string
+	// Rs are the serialized blinding factors (secp256k1 private keys).
+	Rs [][]byte
 }
 
 type MintQuote struct {
