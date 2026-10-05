@@ -61,6 +61,27 @@ func (e *ServerError) Error() string {
 	return fmt.Sprintf("mint %s returned server error (HTTP %d): %s", e.MintURL, e.HTTPStatus, e.Body)
 }
 
+// AmbiguousOutcomeError is returned when a state-changing request was sent
+// and the mint's answer never arrived (connection reset, EOF, timeout): the
+// mint may or may not have processed it. The caller must reconcile the
+// outcome against the mint (NUT-07 checkstate for swap outputs, quote state
+// for mint/melt quotes) before re-deriving or re-sending anything, and any
+// regeneration must come from a freshly incremented counter. It is never
+// correct to re-send the same request body: the outputs it carries may
+// already have been signed, and re-exposing a derivation range is the
+// duplicate-output brick class (#257/#266/#480; measured by the TollGate
+// conformance lane as swap-timeout-retry / no-output-reuse=fail).
+type AmbiguousOutcomeError struct {
+	MintURL string
+	Err     error
+}
+
+func (e *AmbiguousOutcomeError) Error() string {
+	return fmt.Sprintf("mint %s did not answer; the request may have been processed — reconcile before retrying: %v", e.MintURL, e.Err)
+}
+
+func (e *AmbiguousOutcomeError) Unwrap() error { return e.Err }
+
 func isRetriable(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests || statusCode >= 500
 }
@@ -365,7 +386,7 @@ func PostCheckProofState(mintURL string, stateRequest nut07.PostCheckStateReques
 		return nil, fmt.Errorf("json.Marshal: %v", err)
 	}
 
-	resp, err := httpPost(normalizeMintURL(mintURL)+"/v1/checkstate", "application/json", bytes.NewBuffer(requestBody))
+	resp, err := httpPostReadOnly(normalizeMintURL(mintURL)+"/v1/checkstate", "application/json", bytes.NewBuffer(requestBody))
 	if err != nil {
 		return nil, err
 	}
@@ -452,32 +473,82 @@ func getWithRetry(url string, attempt int, retryAfterMs int) (*http.Response, er
 	return parse(resp)
 }
 
+// httpPost sends a state-changing request to the mint. Two rules, both
+// fund-safety, split by what the mint did:
+//
+//   - a 429 IS an answer: the mint refused the request without processing
+//     it, no output was signed, so re-sending the same body after the mint's
+//     own Retry-After is safe and keeps a rate-limited mint usable;
+//   - a transport error is NOT an answer: the request may have been
+//     processed and its signatures lost, and re-sending the same derivation
+//     outputs is the duplicate-output brick class. The error is returned as
+//     AmbiguousOutcomeError after exactly one attempt, never retried here.
+//
+// A 5xx is already terminal for POSTs (ServerError, no retry): a gateway
+// 502/504 after the mint processed the request has exactly the transport
+// error's ambiguity.
 func httpPost(url, contentType string, body io.Reader) (*http.Response, error) {
-	return httpPostWithRetry(url, contentType, body, 0, 0)
-}
-
-func httpPostWithRetry(url, contentType string, body io.Reader, attempt int, retryAfterMs int) (*http.Response, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read request body: %w", err)
 	}
+	return httpPostRateLimited(url, contentType, bodyBytes, 0, 0)
+}
 
+func httpPostRateLimited(url, contentType string, bodyBytes []byte, attempt, retryAfterMs int) (*http.Response, error) {
+	resp, err := httpClient.Post(url, contentType, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, &AmbiguousOutcomeError{MintURL: url, Err: err}
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries {
+		ms := parseRetryAfter(resp)
+		resp.Body.Close()
+		time.Sleep(backoffDuration(attempt, ms))
+		return httpPostRateLimited(url, contentType, bodyBytes, attempt+1, ms)
+	}
+
+	return postResult(resp, url, retryAfterMs)
+}
+
+// httpPostReadOnly is the retrying POST for the one mint call that changes
+// nothing: NUT-07 checkstate, the reconciliation primitive itself. A
+// transport error there is unambiguous — nothing happened — so retrying with
+// backoff is safe and keeps reconciliation usable through the same outages
+// that make the money-moving calls ambiguous.
+func httpPostReadOnly(url, contentType string, body io.Reader) (*http.Response, error) {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+	return httpPostReadOnlyWithRetry(url, contentType, bodyBytes, 0, 0)
+}
+
+func httpPostReadOnlyWithRetry(url, contentType string, bodyBytes []byte, attempt, retryAfterMs int) (*http.Response, error) {
 	resp, err := httpClient.Post(url, contentType, bytes.NewReader(bodyBytes))
 	if err != nil {
 		if attempt < maxRetries {
 			time.Sleep(backoffDuration(attempt, 0))
-			return httpPostWithRetry(url, contentType, bytes.NewReader(bodyBytes), attempt+1, 0)
+			return httpPostReadOnlyWithRetry(url, contentType, bodyBytes, attempt+1, 0)
 		}
 		return nil, err
 	}
 
+	if resp.StatusCode == http.StatusTooManyRequests && attempt < maxRetries {
+		ms := parseRetryAfter(resp)
+		resp.Body.Close()
+		time.Sleep(backoffDuration(attempt, ms))
+		return httpPostReadOnlyWithRetry(url, contentType, bodyBytes, attempt+1, ms)
+	}
+
+	return postResult(resp, url, retryAfterMs)
+}
+
+// postResult is the shared response classifier for the POST paths: a
+// terminal 429 becomes RateLimitError, any 5xx becomes ServerError (never
+// retried — see httpPost), and everything else goes through parse.
+func postResult(resp *http.Response, url string, retryAfterMs int) (*http.Response, error) {
 	if resp.StatusCode == http.StatusTooManyRequests {
-		if attempt < maxRetries {
-			ms := parseRetryAfter(resp)
-			resp.Body.Close()
-			time.Sleep(backoffDuration(attempt, ms))
-			return httpPostWithRetry(url, contentType, bytes.NewReader(bodyBytes), attempt+1, ms)
-		}
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 		resp.Body.Close()
 		return nil, &RateLimitError{
