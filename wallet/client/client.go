@@ -61,6 +61,25 @@ func (e *ServerError) Error() string {
 	return fmt.Sprintf("mint %s returned server error (HTTP %d): %s", e.MintURL, e.HTTPStatus, e.Body)
 }
 
+// AmbiguousResponseError reports a state-changing POST whose outcome is
+// unknown: the request was sent and no answer came back (timeout, connection
+// reset mid-response, EOF after the body was written). The mint may have
+// processed it. The request body carried deterministic derivation outputs
+// that must never be re-sent with the same values: a caller that wants to
+// retry must first reconcile the outcome (NUT-07 checkstate for the inputs,
+// NUT-09 restore for the outputs) and only then regenerate from a freshly
+// incremented counter.
+type AmbiguousResponseError struct {
+	MintURL string
+	Err     error
+}
+
+func (e *AmbiguousResponseError) Error() string {
+	return fmt.Sprintf("mint %s did not answer (outcome unknown, do not resend the same request): %v", e.MintURL, e.Err)
+}
+
+func (e *AmbiguousResponseError) Unwrap() error { return e.Err }
+
 func isRetriable(statusCode int) bool {
 	return statusCode == http.StatusTooManyRequests || statusCode >= 500
 }
@@ -456,6 +475,26 @@ func httpPost(url, contentType string, body io.Reader) (*http.Response, error) {
 	return httpPostWithRetry(url, contentType, body, 0, 0)
 }
 
+// httpPostWithRetry sends a state-changing POST to the mint.
+//
+// A network failure is NEVER retried with the same body. Every POST this
+// client sends carries deterministic derivation outputs (swap inputs and
+// outputs, mint outputs, melt inputs); after a timeout or a dropped
+// connection the mint may already have processed the request, so its outcome
+// is UNKNOWN, not FAILED, and re-sending the identical body would re-expose
+// outputs the mint may already have signed — mint error 10002, the wallet
+// brick class of tollgate #257/#266/#480 (measured on main as issue #640:
+// the swap response dropped, the same blinded messages re-sent, the lab mint
+// tolerating the duplicate a strict mint would refuse). The error is returned
+// as *AmbiguousResponseError so callers can reconcile (NUT-07 checkstate on
+// the inputs, NUT-09 restore for the outputs) before regenerating anything.
+// Go's net/http transport never replays a POST on its own (a request is only
+// replayable when it has no body, or carries an Idempotency-Key), so this
+// loop was the only re-exposure site.
+//
+// The one same-body retry that remains is HTTP 429: a rate-limit answer is
+// produced before the mint processes the request, so the body was not
+// exposed and re-sending it is safe; Retry-After is honoured.
 func httpPostWithRetry(url, contentType string, body io.Reader, attempt int, retryAfterMs int) (*http.Response, error) {
 	bodyBytes, err := io.ReadAll(body)
 	if err != nil {
@@ -464,11 +503,7 @@ func httpPostWithRetry(url, contentType string, body io.Reader, attempt int, ret
 
 	resp, err := httpClient.Post(url, contentType, bytes.NewReader(bodyBytes))
 	if err != nil {
-		if attempt < maxRetries {
-			time.Sleep(backoffDuration(attempt, 0))
-			return httpPostWithRetry(url, contentType, bytes.NewReader(bodyBytes), attempt+1, 0)
-		}
-		return nil, err
+		return nil, &AmbiguousResponseError{MintURL: url, Err: err}
 	}
 
 	if resp.StatusCode == http.StatusTooManyRequests {
