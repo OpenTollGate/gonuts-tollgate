@@ -972,6 +972,16 @@ func (w *Wallet) swapWithRetry(
 	if err != nil {
 		var cashuErr cashu.Error
 		if errors.As(err, &cashuErr) && cashuErr.Code == cashu.BlindedMessageAlreadySignedErrCode {
+			// 10002 is a definitive refusal — the mint rejected the request
+			// before consuming the inputs (it has seen these outputs already)
+			// — so the superseded first intent is never recoverable by
+			// replay and would otherwise resurface as an immortal failed
+			// entry at every ResumePendingSwaps. The retry below records its
+			// own intent; deleting the superseded one here keeps the pending
+			// set exactly the set of ambiguous outcomes.
+			if dErr := w.db.DeletePendingSwap(opID); dErr != nil {
+				log.Printf("wallet: could not delete superseded pending swap %s: %v", opID, dErr)
+			}
 			retryReq, createErr := w.createSwapRequest(proofs, mint)
 			if createErr != nil {
 				return nil, "", fmt.Errorf("could not create retry swap request: %w", createErr)
