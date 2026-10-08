@@ -19,7 +19,7 @@ import (
 // replay of already-exposed swap outputs (tollgate #480/#496).
 func TestAddMintRewriteNeverRewindsCounter(t *testing.T) {
 	const genKey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-	keysJSON := `{"keysets":[{"id":"` + v2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
+	keysJSON := `{"keysets":[{"id":"` + honestV2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
 	for i := 0; i <= 20; i++ {
 		if i > 0 {
 			keysJSON += ","
@@ -33,7 +33,7 @@ func TestAddMintRewriteNeverRewindsCounter(t *testing.T) {
 		case "/v1/keys":
 			fmt.Fprint(w, keysJSON)
 		case "/v1/keysets":
-			fmt.Fprint(w, `{"keysets":[{"id":"`+v2FullID+`","unit":"sat","active":true,"input_fee_ppk":0}]}`)
+			fmt.Fprint(w, `{"keysets":[{"id":"`+honestV2FullID+`","unit":"sat","active":true,"input_fee_ppk":0}]}`)
 		case "/v1/keysets/swaps":
 			fmt.Fprint(w, inactiveJSON)
 		default:
@@ -48,7 +48,7 @@ func TestAddMintRewriteNeverRewindsCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadWallet #1: %v", err)
 	}
-	if err := w1.db.IncrementKeysetCounter(v2FullID, 4242); err != nil {
+	if err := w1.db.IncrementKeysetCounter(honestV2FullID, 4242); err != nil {
 		t.Fatalf("advance counter: %v", err)
 	}
 	w1.Shutdown()
@@ -58,7 +58,7 @@ func TestAddMintRewriteNeverRewindsCounter(t *testing.T) {
 		t.Fatalf("raw open: %v", err)
 	}
 	fresh := &crypto.WalletKeyset{
-		Id: v2FullID, MintURL: srv.URL, Unit: "sat", Active: true, Counter: 0,
+		Id: honestV2FullID, MintURL: srv.URL, Unit: "sat", Active: true, Counter: 0,
 	}
 	if err := db.SaveKeyset(fresh); err != nil {
 		t.Fatalf("SaveKeyset fresh: %v", err)
@@ -71,7 +71,7 @@ func TestAddMintRewriteNeverRewindsCounter(t *testing.T) {
 	}
 	defer w2.Shutdown()
 
-	if got := w2.counterForKeyset(v2FullID); got != 4242 {
+	if got := w2.counterForKeyset(honestV2FullID); got != 4242 {
 		t.Fatalf("keyset rewrite rewound the derivation counter: got %d, want 4242", got)
 	}
 }

@@ -18,7 +18,7 @@ import (
 // re-derives it.
 func TestSwapWithRetryReservesRetryRange(t *testing.T) {
 	const genKey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-	keysJSON := `{"keysets":[{"id":"` + v2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
+	keysJSON := `{"keysets":[{"id":"` + honestV2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
 	for i := 0; i <= 20; i++ {
 		if i > 0 {
 			keysJSON += ","
@@ -42,7 +42,7 @@ func TestSwapWithRetryReservesRetryRange(t *testing.T) {
 		t.Fatalf("mint not registered")
 	}
 
-	proofs := cashu.Proofs{{Id: v2FullID, Amount: 64, Secret: "s64", C: "02ab"}}
+	proofs := cashu.Proofs{{Id: honestV2FullID, Amount: 64, Secret: "s64", C: "02ab"}}
 	req, err := w.createSwapRequest(proofs, &mint)
 	if err != nil {
 		t.Fatalf("createSwapRequest: %v", err)
@@ -66,7 +66,7 @@ func TestSwapWithRetryReservesRetryRange(t *testing.T) {
 		for _, bm := range swapRequest.outputs {
 			retrySeen = append(retrySeen, bm.B_)
 		}
-		return cashu.Proofs{{Id: v2FullID, Amount: 63, Secret: "retry", C: "02cd"}}, nil
+		return cashu.Proofs{{Id: honestV2FullID, Amount: 63, Secret: "retry", C: "02cd"}}, nil
 	}
 	defer func() { swap = nil }()
 
@@ -82,7 +82,7 @@ func TestSwapWithRetryReservesRetryRange(t *testing.T) {
 		t.Fatalf("expected exactly 2 swap calls, got %d", swapCalls)
 	}
 
-	counterAfterRetry := w.counterForKeyset(v2FullID)
+	counterAfterRetry := w.counterForKeyset(honestV2FullID)
 	want := counterAfterFirst + uint32(len(retrySeen))
 	if counterAfterRetry != want {
 		t.Fatalf("counter must cover the retry range: got %d, want %d (first %d + retry %d)",

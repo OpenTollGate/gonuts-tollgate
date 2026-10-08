@@ -37,8 +37,11 @@ func newSigningMint(t *testing.T) *signingMint {
 		m.privs[a] = h
 		pubs[a] = h.PubKey()
 	}
+	// The advertised ID must derive from the published keys — an honest
+	// mint's shape, and what the wallet's keyset verification (tollgate #705)
+	// refuses when a fixture fakes it.
 	m.keyset = crypto.WalletKeyset{
-		Id:         "00" + hex.EncodeToString([]byte("feetest")),
+		Id:         crypto.DeriveKeysetId(pubs),
 		MintURL:    "placeholder",
 		Unit:       "sat",
 		Active:     true,

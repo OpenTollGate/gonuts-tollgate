@@ -21,7 +21,7 @@ import (
 // range instead of replaying the exposed one ("outputs already signed").
 func TestMeltReservesBlankOutputRangeBeforeSending(t *testing.T) {
 	const genKey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-	keysJSON := `{"keysets":[{"id":"` + v2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
+	keysJSON := `{"keysets":[{"id":"` + honestV2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
 	for i := 0; i <= 20; i++ {
 		if i > 0 {
 			keysJSON += ","
@@ -39,7 +39,7 @@ func TestMeltReservesBlankOutputRangeBeforeSending(t *testing.T) {
 		fmt.Fprint(w, keysJSON)
 	})
 	mux.HandleFunc("/v1/keysets", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `{"keysets":[{"id":"`+v2FullID+`","unit":"sat","active":true,"input_fee_ppk":0}]}`)
+		fmt.Fprint(w, `{"keysets":[{"id":"`+honestV2FullID+`","unit":"sat","active":true,"input_fee_ppk":0}]}`)
 	})
 	mux.HandleFunc("/v1/melt/bolt11", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -76,8 +76,8 @@ func TestMeltReservesBlankOutputRangeBeforeSending(t *testing.T) {
 	fundExact := func(tag string) {
 		t.Helper()
 		exact := cashu.Proofs{
-			{Id: v2FullID, Amount: 64, Secret: tag + "-64", C: "02ab"},
-			{Id: v2FullID, Amount: 4, Secret: tag + "-4", C: "02cd"},
+			{Id: honestV2FullID, Amount: 64, Secret: tag + "-64", C: "02ab"},
+			{Id: honestV2FullID, Amount: 4, Secret: tag + "-4", C: "02cd"},
 		}
 		if err := w.db.SaveProofs(exact); err != nil {
 			t.Fatalf("SaveProofs(%s): %v", tag, err)
@@ -103,7 +103,7 @@ func TestMeltReservesBlankOutputRangeBeforeSending(t *testing.T) {
 		}
 	}
 
-	counter0 := w.counterForKeyset(v2FullID)
+	counter0 := w.counterForKeyset(honestV2FullID)
 
 	if _, err := w.Melt("q1"); err == nil {
 		t.Fatalf("first melt against a 500ing mint should fail")
@@ -116,7 +116,7 @@ func TestMeltReservesBlankOutputRangeBeforeSending(t *testing.T) {
 		t.Fatalf("mint saw no blank outputs in the melt request")
 	}
 
-	counter1 := w.counterForKeyset(v2FullID)
+	counter1 := w.counterForKeyset(honestV2FullID)
 	if counter1 != counter0+uint32(len(firstOutputs)) {
 		t.Fatalf("failed melt must still reserve its exposed range: counter %d -> %d, expected +%d",
 			counter0, counter1, len(firstOutputs))
@@ -140,7 +140,7 @@ func TestMeltReservesBlankOutputRangeBeforeSending(t *testing.T) {
 	if replayed != 0 {
 		t.Fatalf("retried melt re-derived %d output(s) from the failed melt's exposed range", replayed)
 	}
-	counter2 := w.counterForKeyset(v2FullID)
+	counter2 := w.counterForKeyset(honestV2FullID)
 	if counter2 != counter0+uint32(len(firstOutputs))+uint32(len(secondOutputs)) {
 		t.Fatalf("counter must cover both exposed ranges exactly: %d, want %d",
 			counter2, counter0+uint32(len(firstOutputs))+uint32(len(secondOutputs)))
