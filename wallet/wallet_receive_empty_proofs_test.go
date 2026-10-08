@@ -19,7 +19,8 @@ import (
 // Receive in goroutines, so the panic crashed the whole process for an
 // unauthenticated remotely-delivered token.
 func TestReceiveEmptyProofsToken(t *testing.T) {
-	const keysetID = "009a1f293253e41e"
+	// the honest ID of the served keyset (computed, see wallet_test.go)
+	keysetID := honestV1SingleKeyID
 	// compressed secp256k1 generator point: valid "02"-prefixed public key
 	const amount1Key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 

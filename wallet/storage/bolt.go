@@ -13,6 +13,7 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut13"
 	"github.com/OpenTollGate/gonuts-tollgate/crypto"
 	bolt "go.etcd.io/bbolt"
 )
@@ -494,6 +495,47 @@ func (db *BoltDB) DeletePendingProofsByQuoteId(quoteId string) error {
 	})
 }
 
+// refuseCollidingKeyset is the NUT-13 residue-collision guard, wired at the
+// one place every keyset writer converges: SaveKeyset. NUT-13 derives
+// secrets and blinding factors from the keyset ID reduced mod 2^31-1, so two
+// keysets whose residues collide make the wallet derive identical preimages
+// for both — and a malicious mint can then use an honest mint's NUT-09
+// /restore endpoint as an oracle to harvest and steal the honest mint's
+// blind signatures (the Conduition cashu disclosure; tollgate #705, where
+// this guard existed unwired). Both the cross-mint and the same-mint
+// rotation case are refused, and exact cross-mint duplicates with them: an
+// identical ID is the same attack with no residue arithmetic at all. A
+// keyset's OWN record — same canonical mint, same ID, as written by
+// rotation-in-place, fee updates, counter merges and the startup loader — is
+// exempt: re-saving is not registration. Inactive keysets are NOT exempt
+// from the comparison: the disclosure's attack targets the inactive keysets
+// of honest mints just as well, so every registered row participates.
+func refuseCollidingKeyset(keysetsb *bolt.Bucket, keyset *crypto.WalletKeyset) error {
+	newMint := canonicalMintURL(keyset.MintURL)
+	return keysetsb.ForEach(func(mintURL, _ []byte) error {
+		mintBucket := keysetsb.Bucket(mintURL)
+		if mintBucket == nil {
+			return nil
+		}
+		rowMint := canonicalMintURL(string(mintURL))
+		return mintBucket.ForEach(func(id, _ []byte) error {
+			if rowMint == newMint && string(id) == keyset.Id {
+				return nil
+			}
+			if err := nut13.CheckCollidingKeysets([]string{string(id)}, []string{keyset.Id}); err != nil {
+				if errors.Is(err, nut13.ErrCollidingKeysetId) {
+					return fmt.Errorf("%w: mint %s keyset %s collides with registered keyset %s of mint %s — refusing to register (NUT-13 residue collision: the wallet would derive the same secrets for both)",
+						nut13.ErrCollidingKeysetId, keyset.MintURL, keyset.Id, string(id), string(mintURL))
+				}
+				// A registered row whose ID cannot parse at all can never
+				// reach derivation; it must not brick unrelated saves.
+				return nil
+			}
+			return nil
+		})
+	})
+}
+
 // NOTE: Keysets are stored in nested buckets by mint URL. I.e a keyset with mint URL
 // http://mint.com will create a bucket inside the KEYSETS_BUCKET named by the mint URL
 // and inside this bucket, save the keysets by keyset id
@@ -505,6 +547,12 @@ func (db *BoltDB) SaveKeyset(keyset *crypto.WalletKeyset) error {
 
 	if err := db.bolt.Update(func(tx *bolt.Tx) error {
 		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
+		// The collision guard runs before anything in this transaction
+		// writes: a refused registration leaves no bucket, no row and no
+		// counter state behind (tollgate #705's no-partial-state contract).
+		if err := refuseCollidingKeyset(keysetsb, keyset); err != nil {
+			return err
+		}
 		mintBucket, err := keysetsb.CreateBucketIfNotExists([]byte(canonicalMintURL(keyset.MintURL)))
 		if err != nil {
 			return err
@@ -528,7 +576,9 @@ func (db *BoltDB) SaveKeyset(keyset *crypto.WalletKeyset) error {
 		}
 		return mintBucket.Put([]byte(keyset.Id), jsonKeyset)
 	}); err != nil {
-		return fmt.Errorf("error saving keyset: %v", err)
+		// %w so a refused registration is matchable with errors.Is on
+		// nut13.ErrCollidingKeysetId by every caller up the stack.
+		return fmt.Errorf("error saving keyset: %w", err)
 	}
 	return nil
 }

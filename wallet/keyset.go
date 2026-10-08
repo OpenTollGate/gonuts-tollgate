@@ -10,6 +10,25 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/wallet/client"
 )
 
+// verifyKeysetId enforces the NUT-02 contract the Conduition cashu disclosure
+// found unenforced in practice: a keyset's ID must be the derivation of the
+// mint's published keys (V1: hash of the keys; V2: hash of keys, unit and
+// input fee). A mint that advertises an ID its keys do not derive to has
+// chosen the ID — the first step of the NUT-13 residue-collision attack
+// (tollgate #705) — and the wallet refuses to register the keyset. The
+// two-call path (GetKeysetKeys) has enforced this since it existed; the
+// single-call /v1/keys path had not, which left the primary path open.
+func verifyKeysetId(id string, keys crypto.PublicKeys, unit string, inputFeePpk uint) error {
+	derived := crypto.DeriveKeysetId(keys)
+	if crypto.IsKeysetIdV2(id) {
+		derived = crypto.DeriveKeysetIdV2(keys, unit, inputFeePpk)
+	}
+	if id != derived {
+		return fmt.Errorf("mint advertised keyset id %s but its published keys derive to %s — refusing (forged keyset id, tollgate #705)", id, derived)
+	}
+	return nil
+}
+
 // GetMintActiveKeyset gets the active keyset with the specified unit.
 // Uses GET /v1/keys (single call) which returns active keysets WITH keys,
 // instead of GET /v1/keysets + GET /v1/keys/{id} (two calls) where the
@@ -25,6 +44,9 @@ func GetMintActiveKeyset(mintURL string, unit cashu.Unit) (*crypto.WalletKeyset,
 		if keyset.Active && keyset.Unit == unit.String() {
 			_, err := hex.DecodeString(keyset.Id)
 			if err == nil {
+				if err := verifyKeysetId(keyset.Id, keyset.Keys, keyset.Unit, keyset.InputFeePpk); err != nil {
+					return nil, err
+				}
 				return &crypto.WalletKeyset{
 					Id:          keyset.Id,
 					MintURL:     mintURL,
@@ -120,19 +142,16 @@ func GetKeysetKeys(mintURL, id string) (crypto.PublicKeys, error) {
 
 	keyset := keysetsResponse.Keysets[0]
 
-	var derivedId string
 	if crypto.IsKeysetIdV2(id) {
 		unit, inputFeePpk, err := getKeysetMetadata(mintURL, id)
 		if err != nil {
 			return nil, fmt.Errorf("error getting keyset metadata: %w", err)
 		}
-		derivedId = crypto.DeriveKeysetIdV2(keyset.Keys, unit, inputFeePpk)
-	} else {
-		derivedId = crypto.DeriveKeysetId(keyset.Keys)
-	}
-
-	if id != derivedId {
-		return nil, fmt.Errorf("Got invalid keyset. Derived id: '%v' but got '%v' from mint", derivedId, keyset.Id)
+		if err := verifyKeysetId(id, keyset.Keys, unit, inputFeePpk); err != nil {
+			return nil, err
+		}
+	} else if err := verifyKeysetId(id, keyset.Keys, "", 0); err != nil {
+		return nil, err
 	}
 
 	return keyset.Keys, nil
@@ -229,6 +248,9 @@ func (w *Wallet) getActiveKeyset(mintURL string) (*crypto.WalletKeyset, error) {
 						return GetKeysetKeys(mintURL, keyset.Id)
 					}()
 					if err != nil {
+						return nil, err
+					}
+					if err := verifyKeysetId(keyset.Id, keys, keyset.Unit, keyset.InputFeePpk); err != nil {
 						return nil, err
 					}
 					activeKeyset = crypto.WalletKeyset{

@@ -19,7 +19,7 @@ import (
 // the maximum counter survives and derivation is disjoint.
 func TestReopenWithAliasSeededDB_NoOutputReplay(t *testing.T) {
 	const genKey = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
-	keysJSON := `{"keysets":[{"id":"` + v2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
+	keysJSON := `{"keysets":[{"id":"` + honestV2FullID + `","unit":"sat","active":true,"input_fee_ppk":0,"keys":{`
 	for i := 0; i <= 20; i++ {
 		if i > 0 {
 			keysJSON += ","
@@ -42,7 +42,7 @@ func TestReopenWithAliasSeededDB_NoOutputReplay(t *testing.T) {
 		return w
 	}
 	proofsFor := func(n uint64) cashu.Proofs {
-		return cashu.Proofs{{Id: v2FullID, Amount: n, Secret: fmt.Sprintf("s%d", n), C: "02ab"}}
+		return cashu.Proofs{{Id: honestV2FullID, Amount: n, Secret: fmt.Sprintf("s%d", n), C: "02ab"}}
 	}
 
 	// Phase 1: pre-restart wallet, derive a swap's outputs.
@@ -59,7 +59,7 @@ func TestReopenWithAliasSeededDB_NoOutputReplay(t *testing.T) {
 	for _, bm := range req1.outputs {
 		seen[bm.B_] = true
 	}
-	if err := w1.db.IncrementKeysetCounter(v2FullID, uint32(len(req1.outputs))); err != nil {
+	if err := w1.db.IncrementKeysetCounter(honestV2FullID, uint32(len(req1.outputs))); err != nil {
 		t.Fatalf("increment: %v", err)
 	}
 	w1.db.Close()
@@ -73,7 +73,7 @@ func TestReopenWithAliasSeededDB_NoOutputReplay(t *testing.T) {
 	}
 	alias := srv.URL + "/"
 	if err := dbRaw.SaveKeysetRawForTests(alias, &crypto.WalletKeyset{
-		Id: v2FullID, MintURL: alias, Unit: "sat", Active: true, Counter: 0,
+		Id: honestV2FullID, MintURL: alias, Unit: "sat", Active: true, Counter: 0,
 	}); err != nil {
 		t.Fatalf("alias wipe: %v", err)
 	}

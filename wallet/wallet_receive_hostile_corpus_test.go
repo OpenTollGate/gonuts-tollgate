@@ -21,8 +21,11 @@ import (
 // wallet's actual check sequence: short-ID resolution → active keyset → DLEQ
 // → empty-guard (#23) → P2PK CanSign on proofs[0] only → swap.
 
+// corpusKeysetID is the honest ID of the corpus mint's static keyset (see
+// honestV1SingleKeyID in wallet_test.go): computed from the published keys.
+var corpusKeysetID = honestV1SingleKeyID
+
 const (
-	corpusKeysetID = "009a1f293253e41e"
 	// compressed secp256k1 generator point — a valid "02"-prefixed pubkey
 	corpusAmount1Key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 	// compressed G/2 — a *different* valid pubkey, used as the attacker's lock key
