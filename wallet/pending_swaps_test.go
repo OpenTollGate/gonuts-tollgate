@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
@@ -231,4 +232,71 @@ func randPrivKey(t *testing.T) *secp256k1.PrivateKey {
 		b[i] = byte(i + 1 + len(t.Name()))
 	}
 	return secp256k1.PrivKeyFromBytes(b)
+}
+
+// TestCreateSwapRequestFeeEqualityProducesNoEmptyOutputs pins the CU107
+// class (tollgate-module-basic-go #752): a token whose value is ENTIRELY
+// consumed by the mint's swap fees used to pass the below-fees guard,
+// split zero, and POST a swap with an empty outputs array — the mint then
+// answered its raw NUT-03 400 ("Outputs are required and must be an
+// array"), surfacing to the payer as an opaque error instead of a fee
+// verdict. The request must be refused locally, in the same "nothing to
+// swap" class as the below-fees case.
+func TestCreateSwapRequestFeeEqualityProducesNoEmptyOutputs(t *testing.T) {
+	m := newSigningMint(t)
+	w, err := LoadWallet(Config{WalletPath: t.TempDir(), CurrentMintURL: m.server.URL})
+	if err != nil {
+		t.Fatalf("LoadWallet: %v", err)
+	}
+	defer w.Shutdown()
+
+	mint, ok := w.mints[m.server.URL]
+	if !ok {
+		t.Fatal("stub mint not registered")
+	}
+	// 1000 ppk per proof = 1 sat per proof: a single 1-sat proof pays
+	// exactly its own fee, leaving zero value to split into outputs.
+	mint.activeKeyset.InputFeePpk = 1000
+
+	proofs := cashu.Proofs{{Id: mint.activeKeyset.Id, Amount: 1, Secret: "fee-eq-secret", C: "02ab"}}
+	_, err = w.createSwapRequest(proofs, &mint)
+	if err == nil {
+		t.Fatal("amount == fee must be refused — it used to produce an empty outputs array (the CU107 class)")
+	}
+	if !strings.Contains(err.Error(), "nothing to swap") {
+		t.Fatalf("error should stay in the nothing-to-swap class callers classify on, got: %v", err)
+	}
+	if m.swaps != 0 {
+		t.Fatalf("no swap may reach the mint, saw %d", m.swaps)
+	}
+}
+
+// TestCreateSwapRequestAboveFeesStillSplits is the boundary's other side:
+// one sat above the fee must still build a swap — the equality guard did
+// not eat the working cases.
+func TestCreateSwapRequestAboveFeesStillSplits(t *testing.T) {
+	m := newSigningMint(t)
+	w, err := LoadWallet(Config{WalletPath: t.TempDir(), CurrentMintURL: m.server.URL})
+	if err != nil {
+		t.Fatalf("LoadWallet: %v", err)
+	}
+	defer w.Shutdown()
+
+	mint, ok := w.mints[m.server.URL]
+	if !ok {
+		t.Fatal("stub mint not registered")
+	}
+	mint.activeKeyset.InputFeePpk = 1000 // 1 sat per proof
+
+	proofs := cashu.Proofs{{Id: mint.activeKeyset.Id, Amount: 2, Secret: "above-fee-secret", C: "02ab"}}
+	req, err := w.createSwapRequest(proofs, &mint)
+	if err != nil {
+		t.Fatalf("2-sat token at a 1-sat fee must swap: %v", err)
+	}
+	if len(req.outputs) == 0 {
+		t.Fatal("2-sat token at a 1-sat fee must produce outputs (1 sat of value)")
+	}
+	if got := uint64(len(req.inputs)); got != 1 {
+		t.Fatalf("inputs = %d, want the single proof", got)
+	}
 }

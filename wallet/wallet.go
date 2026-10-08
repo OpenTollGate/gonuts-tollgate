@@ -864,10 +864,27 @@ func (w *Wallet) createSwapRequest(proofs cashu.Proofs, mint *walletMint) (swapR
 		// fees. Reachable with a remotely delivered token.
 		return swapRequestPayload{}, fmt.Errorf("token amount %d is below the mint's swap fees (%d): nothing to swap", total, fees)
 	}
+	if total == uint64(fees) {
+		// The equal case slipped through the guard above: the subtraction
+		// yields zero, splitWalletTarget(0) returns no amounts, and the
+		// wallet POSTs a swap whose outputs array is empty — the mint then
+		// answers its raw NUT-03 400 ("Outputs are required and must be an
+		// array", the CU107 class), which surfaces to the payer as an
+		// opaque mint error instead of a fee verdict. A token whose value
+		// is ENTIRELY consumed by fees has nothing to swap, exactly like
+		// the below-fees case.
+		return swapRequestPayload{}, fmt.Errorf("token amount %d is entirely consumed by the mint's swap fees (%d): nothing to swap", total, fees)
+	}
 	split := w.splitWalletTarget(total-uint64(fees), mint.mintURL)
 	outputs, secrets, rs, err := w.createBlindedMessages(split, mint.activeKeyset.Id, &keysetCounter)
 	if err != nil {
 		return swapRequestPayload{}, fmt.Errorf("createBlindedMessages: %w", err)
+	}
+	if len(outputs) == 0 {
+		// Belt to braces: any future path that empties the outputs (a
+		// split edge, a fee change) must fail HERE, before the mint is
+		// asked anything — never as the mint's raw empty-outputs 400.
+		return swapRequestPayload{}, fmt.Errorf("swap request for %d sat (fees %d) produced no outputs: refusing to send an empty swap", total, fees)
 	}
 
 	return swapRequestPayload{
