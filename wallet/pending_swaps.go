@@ -35,7 +35,7 @@ var resumeHTTP = &http.Client{Timeout: 30 * time.Second}
 func (w *Wallet) ResumePendingSwaps() (recovered uint64, failed int, err error) {
 	intents := w.db.GetPendingSwaps()
 	for _, intent := range intents {
-		amount, rErr := w.resumeOneSwap(intent)
+		amount, rErr := w.resumeOneSwapSafe(intent)
 		if rErr != nil {
 			failed++
 			log.Printf("wallet: pending swap %s (%s) not recoverable this pass: %v", intent.OpID, intent.MintURL, rErr)
@@ -47,6 +47,21 @@ func (w *Wallet) ResumePendingSwaps() (recovered uint64, failed int, err error) 
 		return 0, failed, fmt.Errorf("%d pending swap(s) unrecoverable this pass", failed)
 	}
 	return recovered, failed, nil
+}
+
+// resumeOneSwapSafe keeps one malformed mint answer (or a future bug in
+// the replay path) from taking the whole boot down: the resume runs at
+// daemon startup, where no caller-provided recover exists, so a panic
+// here would be a boot-loop. Converted into a per-intent failure, the
+// intent stays journaled and the next boot retries it (audit finding
+// #833).
+func (w *Wallet) resumeOneSwapSafe(intent *storage.PendingSwapIntent) (amount uint64, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			amount, err = 0, fmt.Errorf("replay panicked: %v", r)
+		}
+	}()
+	return w.resumeOneSwap(intent)
 }
 
 func (w *Wallet) resumeOneSwap(intent *storage.PendingSwapIntent) (uint64, error) {

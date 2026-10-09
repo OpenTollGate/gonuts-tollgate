@@ -2099,12 +2099,27 @@ func constructProofs(
 ) (cashu.Proofs, error) {
 
 	sigsLenght := len(blindedSignatures)
-	if sigsLenght != len(secrets) || sigsLenght != len(rs) {
+	if sigsLenght != len(secrets) || sigsLenght != len(rs) || sigsLenght != len(blindedMessages) {
 		return nil, errors.New("lengths do not match")
 	}
 
 	proofs := make(cashu.Proofs, len(blindedSignatures))
 	for i, blindedSignature := range blindedSignatures {
+		// The swap response is mint-controlled input, so every
+		// signature must answer the blinded message this wallet sent at
+		// the same index — same amount, same keyset id. Without the
+		// binding, a relabeled Amount re-prices the proof with the
+		// mint's own label and that value flows on into the caller's
+		// accounting (audit finding #831: an 8-sat request accepted a
+		// 64-relabeled signature without an error). Keyset ids compare
+		// case-insensitively, like every other id comparison against
+		// mint-supplied spellings.
+		if blindedSignature.Amount != blindedMessages[i].Amount ||
+			!strings.EqualFold(blindedSignature.Id, blindedMessages[i].Id) {
+			return nil, fmt.Errorf("swap response signature %d does not answer the request (got amount %d id %q, asked %d id %q) — tampered or hostile mint answer",
+				i, blindedSignature.Amount, blindedSignature.Id,
+				blindedMessages[i].Amount, blindedMessages[i].Id)
+		}
 		pubkey, ok := keyset.PublicKeys[blindedSignature.Amount]
 		if !ok {
 			return nil, errors.New("key not found")

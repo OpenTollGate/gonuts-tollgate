@@ -109,7 +109,14 @@ func TestConstructProofs(t *testing.T) {
 		rs[i] = secp256k1.PrivKeyFromBytes(key)
 	}
 
-	proofs, err := constructProofs(signatures, cashu.BlindedMessages{}, secrets, rs, keyset)
+	// The binding check (#831) requires every signature to answer a
+	// blinded message of the same index: mirror the signature amounts and
+	// keyset id, as every production caller's request does.
+	messages := cashu.BlindedMessages{
+		{Amount: signatures[0].Amount, Id: signatures[0].Id, B_: "02ab"},
+		{Amount: signatures[1].Amount, Id: signatures[1].Id, B_: "02cd"},
+	}
+	proofs, err := constructProofs(signatures, messages, secrets, rs, keyset)
 	if err != nil {
 		t.Fatal(err)
 	}
