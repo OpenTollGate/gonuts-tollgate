@@ -854,7 +854,10 @@ func (w *Wallet) createSwapRequest(proofs cashu.Proofs, mint *walletMint) (swapR
 	keysetCounter := w.counterForKeyset(mint.activeKeyset.Id)
 	counterStart := keysetCounter
 
-	fees := feesForProofs(proofs, mint)
+	fees, feeErr := feesForProofs(proofs, mint)
+	if feeErr != nil {
+		return swapRequestPayload{}, feeErr
+	}
 	total := proofs.Amount()
 	if total < uint64(fees) {
 		// Without this guard the subtraction below wraps to a near-max
@@ -1469,7 +1472,11 @@ func (w *Wallet) swapProofs(proofs cashu.Proofs, from, to *walletMint) (uint64, 
 	invoicePct := 0.99
 	proofsAmount := proofs.Amount()
 	amount := float64(proofsAmount) * invoicePct
-	fees := uint64(feesForProofs(proofs, from))
+	feesU, feeErr := feesForProofs(proofs, from)
+	if feeErr != nil {
+		return 0, feeErr
+	}
+	fees := uint64(feesU)
 	for {
 		// request mint quote to the 'to' mint
 		// this will generate an invoice
@@ -1566,7 +1573,11 @@ func (w *Wallet) selectProofsForAmount(
 			}
 		}
 		if includeFees {
-			fees = uint64(feesForProofs(selectedProofs, mint))
+			f, feeErr := feesForProofs(selectedProofs, mint)
+			if feeErr != nil {
+				return nil, feeErr
+			}
+			fees = uint64(f)
 		}
 	}
 
@@ -1635,7 +1646,11 @@ func selectProofsToSend(
 
 		var fees uint64 = 0
 		if includeFees {
-			fees = uint64(feesForProofs(selectedProofs, mint))
+			f, feeErr := feesForProofs(selectedProofs, mint)
+			if feeErr != nil {
+				return nil, feeErr
+			}
+			fees = uint64(f)
 		}
 
 		if selectedProof.Amount >= remainingAmount+fees {
@@ -1657,7 +1672,11 @@ func selectProofsToSend(
 
 	var fees uint64 = 0
 	if includeFees {
-		fees = uint64(feesForProofs(selectedProofs, mint))
+		f, feeErr := feesForProofs(selectedProofs, mint)
+		if feeErr != nil {
+			return nil, feeErr
+		}
+		fees = uint64(f)
 	}
 
 	if selectedProofsSum < amount+fees {
@@ -1720,7 +1739,11 @@ func (w *Wallet) swapToSend(
 	}
 
 	proofsAmount := proofsToSwap.Amount()
-	fees := feesForProofs(proofsToSwap, mint)
+	feesU, feeErr := feesForProofs(proofsToSwap, mint)
+	if feeErr != nil {
+		return nil, feeErr
+	}
+	fees := feesU
 	// blinded messages for change amount
 	if proofsAmount-amount-uint64(fees) > 0 {
 		changeAmount := proofsAmount - amount - uint64(fees)
@@ -1793,7 +1816,11 @@ func (w *Wallet) getProofsForAmountWithOptions(
 
 	var fees uint64 = 0
 	if options.IncludeFees {
-		fees = uint64(feesForProofs(selectedProofs, mint))
+		f, feeErr := feesForProofs(selectedProofs, mint)
+		if feeErr != nil {
+			return nil, feeErr
+		}
+		fees = uint64(f)
 	}
 	totalAmount := amount + fees
 
@@ -1857,7 +1884,11 @@ func (w *Wallet) getProofsForAmount(
 
 	var fees uint64 = 0
 	if includeFees {
-		fees = uint64(feesForProofs(selectedProofs, mint))
+		f, feeErr := feesForProofs(selectedProofs, mint)
+		if feeErr != nil {
+			return nil, feeErr
+		}
+		fees = uint64(f)
 	}
 	totalAmount := amount + uint64(fees)
 
@@ -1948,7 +1979,7 @@ func calculateBlankOutputs(feeReserve uint64) int {
 	return int(math.Max(math.Ceil(math.Log2(float64(feeReserve))), 1))
 }
 
-func feesForProofs(proofs cashu.Proofs, mint *walletMint) uint {
+func feesForProofs(proofs cashu.Proofs, mint *walletMint) (uint, error) {
 	var fees uint = 0
 	for _, proof := range proofs {
 		if mint.activeKeyset.Id == proof.Id {
@@ -1957,9 +1988,17 @@ func feesForProofs(proofs cashu.Proofs, mint *walletMint) uint {
 		}
 		if keyset, ok := mint.inactiveKeysets[proof.Id]; ok {
 			fees += keyset.InputFeePpk
+			continue
 		}
+		// A proof on a keyset the wallet cannot price must never be
+		// swapped on a zero-fee guess (#832 in tollgate-module-basic-go):
+		// silently pricing it at 0 ppk understates the fee, the
+		// below-fee refusal never fires, and the swap consumes the whole
+		// note. Refusing matches what the mint itself does with proofs
+		// on keysets it no longer lists.
+		return 0, fmt.Errorf("cannot price a proof on keyset %s (not the active keyset of %s and not in its known inactive keysets) — refusing the swap rather than assuming zero fee", proof.Id, mint.mintURL)
 	}
-	return (fees + 999) / 1000
+	return (fees + 999) / 1000, nil
 }
 
 func feesForCount(count int, keyset *crypto.WalletKeyset) uint {
