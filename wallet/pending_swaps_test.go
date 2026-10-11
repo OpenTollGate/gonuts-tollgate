@@ -12,6 +12,7 @@ import (
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut03"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut09"
 	"github.com/OpenTollGate/gonuts-tollgate/crypto"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
@@ -26,11 +27,29 @@ type signingMint struct {
 	keyset  crypto.WalletKeyset
 	swaps   int
 	lastReq []byte
+	// refusal, when non-nil, makes /v1/swap answer with this mint error
+	// instead of signing — the beyond-window replay shape (cdk-mintd
+	// emits {"code":11001,"detail":"Token Already Spent"} once its
+	// NUT-19 response cache no longer holds the answer).
+	refusal *cashu.Error
+	// refusalFor, when set, decides per request (by its inputs) which
+	// mint error to answer with — mixed-outcome fixtures where some
+	// replays are refused and others are served.
+	refusalFor func(*nut03.PostSwapRequest) *cashu.Error
+	// shuffleRestore reverses the /v1/restore response order — cdk
+	// returns matched-only arrays in its own order, not the request's.
+	shuffleRestore bool
+	// signed remembers every output the stub has signed, keyed by B_ —
+	// the /v1/restore memory.
+	signed          map[string]cashu.BlindedSignature
+	restoreCalls    int
+	restoreErr      bool
+	dropLastRestore bool
 }
 
 func newSigningMint(t *testing.T) *signingMint {
 	t.Helper()
-	m := &signingMint{t: t, privs: map[uint64]*secp256k1.PrivateKey{}}
+	m := &signingMint{t: t, privs: map[uint64]*secp256k1.PrivateKey{}, signed: map[string]cashu.BlindedSignature{}}
 	pubs := crypto.PublicKeys{}
 	for _, a := range []uint64{1, 2, 4, 8, 16, 32, 64} {
 		h := randPrivKey(t)
@@ -68,6 +87,16 @@ func newSigningMint(t *testing.T) *signingMint {
 		m.swaps++
 		raw, _ := json.Marshal(req)
 		m.lastReq = raw
+		refusal := m.refusal
+		if m.refusalFor != nil {
+			refusal = m.refusalFor(&req)
+		}
+		if refusal != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(*refusal)
+			return
+		}
 		sigs := cashu.BlindedSignatures{}
 		for _, out := range req.Outputs {
 			B_, err := hex.DecodeString(out.B_)
@@ -81,13 +110,46 @@ func newSigningMint(t *testing.T) *signingMint {
 				return
 			}
 			C_ := crypto.SignBlindedMessage(BPub, m.privs[out.Amount])
-			sigs = append(sigs, cashu.BlindedSignature{
+			sig := cashu.BlindedSignature{
 				Amount: out.Amount,
 				Id:     m.keyset.Id,
 				C_:     hex.EncodeToString(C_.SerializeCompressed()),
-			})
+			}
+			m.signed[out.B_] = sig
+			sigs = append(sigs, sig)
 		}
 		_ = json.NewEncoder(w).Encode(nut03.PostSwapResponse{Signatures: sigs})
+	})
+	mux.HandleFunc("/v1/restore", func(w http.ResponseWriter, r *http.Request) {
+		m.restoreCalls++
+		var req nut09.PostRestoreRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if m.restoreErr {
+			http.Error(w, "restore unavailable", 500)
+			return
+		}
+		outs := cashu.BlindedMessages{}
+		sigs := cashu.BlindedSignatures{}
+		for _, out := range req.Outputs {
+			if sig, ok := m.signed[out.B_]; ok {
+				outs = append(outs, out)
+				sigs = append(sigs, sig)
+			}
+		}
+		if m.dropLastRestore && len(outs) > 0 {
+			outs = outs[:len(outs)-1]
+			sigs = sigs[:len(sigs)-1]
+		}
+		if m.shuffleRestore {
+			for i, j := 0, len(outs)-1; i < j; i, j = i+1, j-1 {
+				outs[i], outs[j] = outs[j], outs[i]
+				sigs[i], sigs[j] = sigs[j], sigs[i]
+			}
+		}
+		_ = json.NewEncoder(w).Encode(nut09.PostRestoreResponse{Outputs: outs, Signatures: sigs})
 	})
 	m.server = httptest.NewServer(mux)
 	t.Cleanup(m.server.Close)
