@@ -32,6 +32,13 @@ type signingMint struct {
 	// emits {"code":11001,"detail":"Token Already Spent"} once its
 	// NUT-19 response cache no longer holds the answer).
 	refusal *cashu.Error
+	// refusalFor, when set, decides per request (by its inputs) which
+	// mint error to answer with — mixed-outcome fixtures where some
+	// replays are refused and others are served.
+	refusalFor func(*nut03.PostSwapRequest) *cashu.Error
+	// shuffleRestore reverses the /v1/restore response order — cdk
+	// returns matched-only arrays in its own order, not the request's.
+	shuffleRestore bool
 	// signed remembers every output the stub has signed, keyed by B_ —
 	// the /v1/restore memory.
 	signed          map[string]cashu.BlindedSignature
@@ -80,10 +87,14 @@ func newSigningMint(t *testing.T) *signingMint {
 		m.swaps++
 		raw, _ := json.Marshal(req)
 		m.lastReq = raw
-		if m.refusal != nil {
+		refusal := m.refusal
+		if m.refusalFor != nil {
+			refusal = m.refusalFor(&req)
+		}
+		if refusal != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(*m.refusal)
+			_ = json.NewEncoder(w).Encode(*refusal)
 			return
 		}
 		sigs := cashu.BlindedSignatures{}
@@ -131,6 +142,12 @@ func newSigningMint(t *testing.T) *signingMint {
 		if m.dropLastRestore && len(outs) > 0 {
 			outs = outs[:len(outs)-1]
 			sigs = sigs[:len(sigs)-1]
+		}
+		if m.shuffleRestore {
+			for i, j := 0, len(outs)-1; i < j; i, j = i+1, j-1 {
+				outs[i], outs[j] = outs[j], outs[i]
+				sigs[i], sigs[j] = sigs[j], sigs[i]
+			}
 		}
 		_ = json.NewEncoder(w).Encode(nut09.PostRestoreResponse{Outputs: outs, Signatures: sigs})
 	})
