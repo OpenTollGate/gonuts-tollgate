@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
@@ -285,5 +286,101 @@ func TestResumeRetiresWalletResidentInputsOnRestoreRecovery(t *testing.T) {
 	}
 	if len(w.db.GetPendingSwaps()) != 0 {
 		t.Fatal("intent must be retired after restore recovery")
+	}
+}
+
+// cdk's /v1/restore returns matched-only outputs in its own order, not the
+// request's — the B_-join realignment must unblind correctly regardless.
+func TestResumeHandlesShuffledRestoreOrder(t *testing.T) {
+	m := newSigningMint(t)
+	w, err := LoadWallet(Config{WalletPath: t.TempDir(), CurrentMintURL: m.server.URL})
+	if err != nil {
+		t.Fatalf("LoadWallet: %v", err)
+	}
+	defer w.Shutdown()
+
+	origSwap := swap
+	swap = crashAfterMintAccepts
+	req := m.newSwapRequest(t, w, 64)
+	if len(req.outputs) < 2 {
+		t.Fatalf("fixture needs multiple outputs to shuffle, got %d", len(req.outputs))
+	}
+	_, _, _ = w.swapWithIntent(m.server.URL, req)
+	swap = origSwap
+	m.refusal = spendRefusal()
+	m.shuffleRestore = true
+
+	recovered, failed, err := w.ResumePendingSwaps()
+	if err != nil || failed != 0 || recovered != 64 {
+		t.Fatalf("resume: recovered=%d failed=%d err=%v, want 64/0/nil", recovered, failed, err)
+	}
+	if w.GetBalance() != 64 {
+		t.Fatalf("balance = %d, want 64 — shuffled order must not corrupt unblinding", w.GetBalance())
+	}
+	if len(w.db.GetPendingSwaps()) != 0 {
+		t.Fatal("intent must be retired after shuffled-restore recovery")
+	}
+	if m.restoreCalls != 1 {
+		t.Fatalf("restore called %d times, want 1", m.restoreCalls)
+	}
+}
+
+// Three journaled intents, three mint verdicts on replay: one refused 11001
+// (recovers via restore), one answered 200 (recovers via replay), one refused
+// non-11001 (stays journaled). Resume must treat them independently.
+func TestResumeMixedOutcomesAcrossIntents(t *testing.T) {
+	m := newSigningMint(t)
+	w, err := LoadWallet(Config{WalletPath: t.TempDir(), CurrentMintURL: m.server.URL})
+	if err != nil {
+		t.Fatalf("LoadWallet: %v", err)
+	}
+	defer w.Shutdown()
+
+	mint, ok := w.mints[m.server.URL]
+	if !ok {
+		t.Fatal("stub mint not registered")
+	}
+	crashIntent := func(secret string, amount uint64) {
+		origSwap := swap
+		swap = crashAfterMintAccepts
+		inputs := cashu.Proofs{{Id: m.keyset.Id, Amount: amount, Secret: secret, C: "02ab"}}
+		req, cErr := w.createSwapRequest(inputs, &mint)
+		if cErr != nil {
+			t.Fatalf("createSwapRequest(%s): %v", secret, cErr)
+		}
+		_, _, _ = w.swapWithIntent(m.server.URL, req)
+		swap = origSwap
+	}
+	crashIntent("spent-restore-path", 16)
+	crashIntent("replay-cache-path", 8)
+	crashIntent("other-err-path", 4)
+	if len(w.db.GetPendingSwaps()) != 3 {
+		t.Fatalf("fixture: %d intents journaled, want 3", len(w.db.GetPendingSwaps()))
+	}
+
+	m.refusalFor = func(req *nut03.PostSwapRequest) *cashu.Error {
+		for _, in := range req.Inputs {
+			if strings.Contains(in.Secret, "spent-restore") {
+				return spendRefusal()
+			}
+			if strings.Contains(in.Secret, "other-err") {
+				return cashu.BuildCashuError("proof verification failed", cashu.CashuErrCode(10001))
+			}
+		}
+		return nil
+	}
+
+	recovered, failed, err := w.ResumePendingSwaps()
+	if err != nil || failed != 1 || recovered != 24 {
+		t.Fatalf("resume: recovered=%d failed=%d err=%v, want 24/1/nil", recovered, failed, err)
+	}
+	if w.GetBalance() != 24 {
+		t.Fatalf("balance = %d, want 24 (16 restored + 8 replayed)", w.GetBalance())
+	}
+	if remaining := len(w.db.GetPendingSwaps()); remaining != 1 {
+		t.Fatalf("%d intents remaining, want exactly the non-11001 one", remaining)
+	}
+	if m.restoreCalls != 1 {
+		t.Fatalf("restore called %d times, want 1 — only the 11001 refusal arms it", m.restoreCalls)
 	}
 }
