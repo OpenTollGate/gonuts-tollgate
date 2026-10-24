@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/OpenTollGate/gonuts-tollgate/crypto"
@@ -27,6 +28,39 @@ func verifyKeysetId(id string, keys crypto.PublicKeys, unit string, inputFeePpk 
 		return fmt.Errorf("mint advertised keyset id %s but its published keys derive to %s — refusing (forged keyset id, tollgate #705)", id, derived)
 	}
 	return nil
+}
+
+// IsUnknownKeysetError reports whether err is (or wraps) a mint's NUT-19
+// "unknown keyset" refusal (code 12001, or the detail text mints spell it
+// with — Nutshell sends "Unknown Keyset", others "unknown keyset"). It is
+// the mint saying it no longer knows that keyset id: the keyset has been
+// rotated out and dropped from its keyset list. Callers use it to separate
+// "the mint retired this keyset" (recoverable: re-fetch the current keyset
+// set, NUT-02) from every other fetch failure — the classification tollgate
+// #818 needs at wallet init, where this error used to be treated as fatal
+// and bricked the wallet into degraded mode while the mint was reachable.
+func IsUnknownKeysetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var value cashu.Error
+	if errors.As(err, &value) {
+		return isUnknownKeysetDetail(value.Code, value.Detail)
+	}
+	var pointer *cashu.Error
+	if errors.As(err, &pointer) {
+		return isUnknownKeysetDetail(pointer.Code, pointer.Detail)
+	}
+	// The mint's detail text verbatim may survive wraps that lose the typed
+	// error; match it so a differently-serialized mint still classifies.
+	return strings.Contains(strings.ToLower(err.Error()), "unknown keyset")
+}
+
+func isUnknownKeysetDetail(code cashu.CashuErrCode, detail string) bool {
+	if code == cashu.UnknownKeysetErrCode {
+		return true
+	}
+	return strings.Contains(strings.ToLower(detail), "unknown keyset")
 }
 
 // GetMintActiveKeyset gets the active keyset with the specified unit.
@@ -207,11 +241,18 @@ func (w *Wallet) getActiveKeyset(mintURL string) (*crypto.WalletKeyset, error) {
 
 	// if new active, save it to db and inactivate previous
 	if activeChanged {
-		// inactivate previous active
-		activeKeyset.Active = false
-		mint.inactiveKeysets[activeKeyset.Id] = activeKeyset
-		if err := w.db.SaveKeyset(&activeKeyset); err != nil {
-			return nil, err
+		// inactivate previous active — but only if there IS one. When every
+		// stored record of this mint was skipped at load (retired by the
+		// mint, tollgate #818), activeKeyset is the zero WalletKeyset and
+		// saving it would write a record with no MintURL into a bucket named
+		// "" (bolt: "bucket name required") — and there is nothing to
+		// inactivate anyway.
+		if activeKeyset.Id != "" {
+			activeKeyset.Active = false
+			mint.inactiveKeysets[activeKeyset.Id] = activeKeyset
+			if err := w.db.SaveKeyset(&activeKeyset); err != nil {
+				return nil, err
+			}
 		}
 
 		for _, keyset := range allKeysets.Keysets {

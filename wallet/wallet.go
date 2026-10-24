@@ -2193,6 +2193,25 @@ func (w *Wallet) loadWalletMints() (map[string]walletMint, error) {
 						fmt.Printf("Warning: %v\nSkipping keyset %s until connection is restored.\n\n", wrappedErr, keyset.Id)
 						continue
 					}
+					if IsUnknownKeysetError(err) {
+						// The mint is reachable but no longer knows this keyset
+						// id: rotated out and dropped from its list (tollgate
+						// #818 — testnut-class mints rotate the entire set).
+						// This is NOT fatal: the mint's current keyset set is
+						// re-fetched (NUT-02) by the LoadWallet/getActiveKeyset
+						// path, and init must proceed.
+						//
+						// Fund safety: the DB record is RETAINED untouched —
+						// no SaveKeyset, no delete — so the derivation counter
+						// keeps its monotonic value (#480) and any proofs still
+						// keyed to this keyset survive in the wallet; only the
+						// in-memory load skips the keyset for this session.
+						// If the mint still honors swaps of these proofs they
+						// remain spendable; if not, they are still counted by
+						// CheckUnspentProofs against the mint's answer.
+						fmt.Printf("Warning: mint %s no longer knows keyset %s — keyset retired by rotation; retaining record (counter/proofs preserved), skipping for this session.\n\n", keyset.MintURL, keyset.Id)
+						continue
+					}
 					return nil, err
 				}
 				keyset.PublicKeys = publicKeys
