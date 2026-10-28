@@ -258,30 +258,6 @@ func (w *Wallet) resumeSwapViaRestore(intent *storage.PendingSwapIntent) (uint64
 	return w.finishRecoveredSwap(intent, resp.Signatures, resp.Outputs, secrets, rs, " via NUT-09 restore")
 }
 
-// finishRecoveredSwap unblinds the recovered signatures against the
-// journaled derivation material, stores the proofs, and retires the
-// intent. It is the shared tail of both recovery paths — the NUT-19
-// replay (200 + signatures, aligned as journaled) and the NUT-09 restore
-// fallback (realigned by B_) — so both leave identical postconditions:
-// proofs saved, intent deleted, amount reported.
-func (w *Wallet) finishRecoveredSwap(
-	intent *storage.PendingSwapIntent,
-	signatures cashu.BlindedSignatures,
-	messages cashu.BlindedMessages,
-	secrets []string,
-	rs []*secp256k1.PrivateKey,
-	via string,
-) (uint64, error) {
-	keyset := w.db.GetKeyset(intent.KeysetID)
-	if keyset == nil {
-		return 0, fmt.Errorf("keyset %s no longer in wallet db (rotated away?)", intent.KeysetID)
-	}
-
-	rs := intentBlindingFactors(intent)
-
-	return w.finishResume(intent, swapResponse.Signatures)
-}
-
 // finishResume is the replay-path convenience tail: the journaled outputs,
 // secrets and factors in intent order, no via suffix.
 func (w *Wallet) finishResume(intent *storage.PendingSwapIntent, signatures cashu.BlindedSignatures) (uint64, error) {
