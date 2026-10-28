@@ -121,7 +121,6 @@ func (w *Wallet) resumeOneMint(intent *storage.PendingSwapIntent) (uint64, error
 		return 0, fmt.Errorf("could not parse replay response: %w", err)
 	}
 	return w.finishResume(intent, mintResponse.Signatures)
->>>>>>> d3cf84b (feat(wallet): pending-op intents for the mint path — crashed mints recover by replay (#497))
 }
 
 // resumeOneMelt replays a /v1/melt/bolt11 request. cdk-mintd replays
