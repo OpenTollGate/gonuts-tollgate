@@ -391,10 +391,18 @@ func VerifyP2PKLockedProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret)
 
 		if p2pkTags.NSigs > 0 {
 			signaturesRequired = p2pkTags.NSigs
-			if len(p2pkTags.Pubkeys) == 0 {
-				return EmptyPubkeysErr
+			// NUT-11: the signable key set is the primary key (secret.data)
+			// UNION the optional `pubkeys` tag. A separate pubkeys tag is NOT
+			// required when n_sigs is present — n_sigs:1 with only the data
+			// key is the canonical single-key lock every reference wallet
+			// emits (cashu-audit #59 P1 shape-1: well-formed P2PK proofs were
+			// rejected with EmptyPubkeysErr on BOTH swap and melt paths).
+			if len(p2pkTags.Pubkeys) > 0 {
+				keys = append(keys, p2pkTags.Pubkeys...)
 			}
-			keys = append(keys, p2pkTags.Pubkeys...)
+			if signaturesRequired > len(keys) {
+				return NotEnoughSignaturesErr
+			}
 		}
 
 		if len(p2pkWitness.Signatures) < 1 {
