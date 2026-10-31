@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Melt-quote double-settlement: atomic UNPAID→PENDING CAS before payment
+  (two concurrent melts on one quote both paid); failure paths roll the
+  claim back so quotes stay retryable (cashu-audit #59 P0).
+- Same-proofs/two-quotes double spend: proof settlement
+  (pending→used) is one transaction and the pending-insert checks
+  proofs-used inside its own transaction — the two-statement settle
+  left a re-claim window.
+- Mint-quote double issuance: atomic PAID→PENDING CAS in MintTokens plus
+  full quote-state transition discipline — every mint-quote writer is
+  conditional (the invoice-subscription settled event previously wrote
+  PAID over Pending/Issued, resurrecting finished states).
+- SIG_ALL spec alignment (tollgate #809): the witness lives in the
+  FIRST input and signs the aggregated transaction message (melt binds
+  the quote id) — P2PK and HTLC arms; the non-spec per-output witness
+  lane is retired; melts no longer reject SIG_ALL. n_sigs=0 and
+  n_sigs_refund=0 are malformed; duplicate keys per pathway rejected;
+  locktime expiry is additive (refund AND primary; no-refund =
+  anyone-can-spend); the wallet produces the spec witness.
+- NUT-20 mint-quote signatures: dual-accept (legacy cdk framing AND the
+  spec `Cashu_MintQuoteSig_v1` domain-separated framing).
+- NUT-19: melt responses are replay-cached — a lost melt response
+  replays byte-identical instead of erroring ambiguously.
+- Mint saga crash-consistency: signatures persist before the Issued
+  write, and Pending/Issued quotes with a fully signed output set replay
+  the stored signatures (completing Pending→Issued) — a client can
+  recover its signatures after any crash point.
+
+### Added
+- NUT-29 batch endpoints: atomic batch mint across paid quotes
+  (claim/rollback discipline, NUT-20 per-quote signatures over the
+  consolidated outputs, output limit 1000) and batch quote check
+  (request-order, all-or-nothing, limit 50); limits advertised in info.
+- Quote hygiene: quote ids are UUID v7, amount_issued accounting in
+  quote-state responses, zero-amount mint quotes rejected.
+
+### Changed
+- Swap inputs are claimed (pending-proofs) before signing — the loser
+  fails before signature computation; defense-in-depth on top of the
+  settle-time uniqueness guard.
+
 ## [v0.15.0] - 2026-10-28
 
 ### Added
