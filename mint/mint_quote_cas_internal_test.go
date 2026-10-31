@@ -13,25 +13,68 @@ import (
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
 
-// internalTestOutputs builds n zero-amount blinded messages directly (no
-// testutils dependency — it cannot be imported from package mint).
-func internalTestOutputs(keysetId string, n int) cashu.BlindedMessages {
+// internalTestOutputs builds n 8-sat blinded messages directly (no
+// testutils dependency — it cannot be imported from package mint) and
+// returns the secrets/blinding factors for proof construction.
+func internalTestOutputs(keysetId string, n int) (cashu.BlindedMessages, []string, []*secp256k1.PrivateKey) {
 	outputs := make(cashu.BlindedMessages, n)
+	secrets := make([]string, n)
+	rs := make([]*secp256k1.PrivateKey, n)
 	for i := 0; i < n; i++ {
 		secretBytes := make([]byte, 32)
 		rand.Read(secretBytes)
-		secret := hex.EncodeToString(secretBytes)
+		secrets[i] = hex.EncodeToString(secretBytes)
 		r, err := secp256k1.GeneratePrivateKey()
 		if err != nil {
 			panic(err)
 		}
-		B_, _, err := crypto.BlindMessage(secret, r)
+		rs[i] = r
+		B_, _, err := crypto.BlindMessage(secrets[i], r)
 		if err != nil {
 			panic(err)
 		}
 		outputs[i] = cashu.NewBlindedMessage(keysetId, 8, B_)
 	}
-	return outputs
+	return outputs, secrets, rs
+}
+
+// internalTestProofs mints n valid 8-sat proofs (unblinds with
+// crypto.UnblindSignature against the active keyset).
+func internalTestProofs(t *testing.T, m *Mint, n int) cashu.Proofs {
+	t.Helper()
+	quote, err := m.RequestMintQuote(nut04.PostMintQuoteBolt11Request{
+		Amount: uint64(8 * n),
+		Unit:   cashu.Sat.String(),
+	})
+	if err != nil {
+		t.Fatalf("error requesting mint quote: %v", err)
+	}
+	keyset := m.GetActiveKeyset()
+	outputs, secrets, rs := internalTestOutputs(keyset.Id, n)
+	sigs, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: quote.Id, Outputs: outputs})
+	if err != nil {
+		t.Fatalf("error minting tokens: %v", err)
+	}
+	proofs := make(cashu.Proofs, len(sigs))
+	for i, sig := range sigs {
+		C_bytes, err := hex.DecodeString(sig.C_)
+		if err != nil {
+			t.Fatal(err)
+		}
+		C_, err := secp256k1.ParsePubKey(C_bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		A := keyset.Keys[outputs[i].Amount]
+		C := crypto.UnblindSignature(C_, rs[i], A)
+		proofs[i] = cashu.Proof{
+			Id:     keyset.Id,
+			Amount: outputs[i].Amount,
+			Secret: secrets[i],
+			C:      hex.EncodeToString(C.SerializeCompressed()),
+		}
+	}
+	return proofs
 }
 
 // TestMintQuoteConcurrentDoubleIssuance stages the double-issuance race
@@ -62,8 +105,8 @@ func TestMintQuoteConcurrentDoubleIssuance(t *testing.T) {
 		}
 
 		keyset := m.GetActiveKeyset()
-		outsA := internalTestOutputs(keyset.Id, 1)
-		outsB := internalTestOutputs(keyset.Id, 1)
+		outsA, _, _ := internalTestOutputs(keyset.Id, 1)
+		outsB, _, _ := internalTestOutputs(keyset.Id, 1)
 
 		// two-party barrier: both callers pass the quote read, then wait
 		// for each other, then race to the claim.
@@ -108,6 +151,67 @@ func TestMintQuoteConcurrentDoubleIssuance(t *testing.T) {
 		}
 		if finalQuote.State != nut04.Issued {
 			t.Fatalf("round %d: quote must end Issued, got %v", round, finalQuote.State)
+		}
+	}
+}
+
+// TestSwapSameProofsConcurrentDoubleSpend stages the swap-side race
+// deterministically: the swapClaimBarrier seam holds both callers between
+// their read-checks and the proof claim, so both verified before either
+// claims — the interleaving where only the claim (not the read-checks)
+// prevents signing the same proofs twice (cashu-audit #59).
+func TestSwapSameProofsConcurrentDoubleSpend(t *testing.T) {
+	m, err := LoadMint(Config{
+		MintPath:        t.TempDir(),
+		LightningClient: &lightning.FakeBackend{},
+		LogLevel:        Disable,
+	})
+	if err != nil {
+		t.Fatalf("error loading mint: %v", err)
+	}
+	const rounds = 10
+
+	for round := 0; round < rounds; round++ {
+		proofs := internalTestProofs(t, m, 1)
+		keyset := m.GetActiveKeyset()
+		outsA, _, _ := internalTestOutputs(keyset.Id, 1)
+		outsB, _, _ := internalTestOutputs(keyset.Id, 1)
+
+		var barrier sync.WaitGroup
+		barrier.Add(2)
+		prevBarrier := swapClaimBarrier
+		swapClaimBarrier = func() {
+			barrier.Done()
+			barrier.Wait()
+		}
+
+		errs := make([]error, 2)
+		var wg sync.WaitGroup
+		for i, outs := range []cashu.BlindedMessages{outsA, outsB} {
+			wg.Add(1)
+			go func(i int, outs cashu.BlindedMessages) {
+				defer wg.Done()
+				_, err := m.Swap(proofs, outs)
+				errs[i] = err
+			}(i, outs)
+		}
+		wg.Wait()
+		swapClaimBarrier = prevBarrier
+
+		winners := 0
+		for _, err := range errs {
+			if err == nil {
+				winners++
+			}
+		}
+		if winners != 1 {
+			t.Fatalf("round %d: exactly one swap must sign, got %d (errs: %v / %v)",
+				round, winners, errs[0], errs[1])
+		}
+
+		// the proofs must end spent, with no pending residue
+		if _, err := m.Swap(proofs, outsB); err == nil {
+			t.Fatalf("round %d: the spent proofs must not swap again", round)
 		}
 	}
 }

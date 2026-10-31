@@ -518,6 +518,17 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 	return blindedSignatures, nil
 }
 
+// swapClaimMarker rides the pending_proofs.melt_quote_id column for swap
+// claims (swaps have no quote to serialize on — the proof set itself is
+// the claim key).
+const swapClaimMarker = "swap"
+
+// swapClaimBarrier is a test seam (the postMeltBolt11 pattern): invoked
+// between Swap's read-checks and the proof claim, so tests can stage both
+// callers past verification before either claims — the same-proofs
+// double-spend race window.
+var swapClaimBarrier = func() {}
+
 // Swap will process a request to swap tokens.
 // A swap requires a set of valid proofs and blinded messages.
 // If valid, the mint will sign the blindedMessages and invalidate
@@ -585,15 +596,35 @@ func (m *Mint) Swap(proofs cashu.Proofs, blindedMessages cashu.BlindedMessages) 
 		}
 	}
 
+	// Atomically claim the input proofs BEFORE signing (the swap-side
+	// sibling of the quote CAS — cashu-audit #59): two concurrent swaps
+	// with the SAME proofs both passed the read-checks above and both
+	// signed — a double spend. The pending-insert (unique secret + the
+	// in-tx used-check) is the race verdict; the loser gets a pending/
+	// spent error and signs nothing.
+	swapClaimBarrier()
+	if err := m.db.AddPendingProofs(proofs, swapClaimMarker); err != nil {
+		if errors.Is(err, cashu.ProofAlreadyUsedErr) {
+			return nil, cashu.ProofAlreadyUsedErr
+		}
+		errmsg := fmt.Sprintf("error claiming swap proofs: %v", err)
+		return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	}
+
 	// if verification complete, sign blinded messages
 	blindedSignatures, err := m.signBlindedMessages(blindedMessages)
 	if err != nil {
+		// release the claim so a corrected retry stays possible
+		if rmErr := m.db.RemovePendingProofs(Ys); rmErr != nil {
+			m.logErrorf("swap proof-claim rollback failed (proofs may rest PENDING): %v (sign error: %v)", rmErr, err)
+		}
 		return nil, err
 	}
 
-	// invalidate proofs after signing blinded messages
-	if err := m.db.SaveProofs(proofs); err != nil {
-		errmsg := fmt.Sprintf("error invalidating proofs. Could not save proofs to db: %v", err)
+	// invalidate proofs atomically (pending -> used in one transaction —
+	// the two-statement form left a re-claim window, see SettleProofs)
+	if err := m.db.SettleProofs(Ys, proofs); err != nil {
+		errmsg := fmt.Sprintf("error settling swap proofs (pending->used must be atomic): %v", err)
 		return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 	if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
