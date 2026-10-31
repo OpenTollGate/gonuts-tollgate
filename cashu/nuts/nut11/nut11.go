@@ -18,11 +18,12 @@ import (
 
 const (
 	// supported tags
-	SIGFLAG  = "sigflag"
-	NSIGS    = "n_sigs"
-	PUBKEYS  = "pubkeys"
-	LOCKTIME = "locktime"
-	REFUND   = "refund"
+	SIGFLAG     = "sigflag"
+	NSIGS       = "n_sigs"
+	PUBKEYS     = "pubkeys"
+	LOCKTIME    = "locktime"
+	REFUND      = "refund"
+	NSIGSREFUND = "n_sigs_refund"
 
 	// SIGFLAG types
 	SIGINPUTS = "SIG_INPUTS"
@@ -56,11 +57,12 @@ type P2PKWitness struct {
 
 // NUT #11: More complex spending conditions can be defined in the tags in `Secret.tags`.
 type P2PKTags struct {
-	Sigflag  string
-	NSigs    int
-	Pubkeys  []*btcec.PublicKey
-	Locktime int64
-	Refund   []*btcec.PublicKey
+	Sigflag     string
+	NSigs       int
+	Pubkeys     []*btcec.PublicKey
+	Locktime    int64
+	Refund      []*btcec.PublicKey
+	NSigsRefund int
 }
 
 func SerializeP2PKTags(p2pkTags P2PKTags) [][]string {
@@ -98,7 +100,11 @@ func SerializeP2PKTags(p2pkTags P2PKTags) [][]string {
 
 // NUT #11: Each of the above tags may appear exactly **ONCE** in a P2PK secret. If a tag appears more than once, the P2PK secret is malformed and the Proof **MUST** be rejected as unspendable.
 func ParseP2PKTags(tags [][]string) (*P2PKTags, error) {
-	if len(tags) > 5 {
+	// NUT-11 defines exactly six tag types: sigflag, n_sigs, locktime,
+	// refund, pubkeys, n_sigs_refund. The former cap of 5 rejected
+	// well-formed secrets carrying all six (cashu-audit #59: the
+	// 'too many tags' family). Duplicates are still rejected below.
+	if len(tags) > 6 {
 		return nil, TooManyTagsErr
 	}
 
@@ -166,6 +172,17 @@ func ParseP2PKTags(tags [][]string) (*P2PKTags, error) {
 				j++
 			}
 			p2pkTags.Refund = refundKeys
+		case NSIGSREFUND:
+			nstr := tag[1]
+			nsigr, err := strconv.ParseInt(nstr, 10, 8)
+			if err != nil {
+				errmsg := fmt.Sprintf("invalid n_sigs_refund value: %v", err)
+				return nil, cashu.BuildCashuError(errmsg, NUT11ErrCode)
+			}
+			if nsigr < 0 {
+				return nil, NSigsMustBePositiveErr
+			}
+			p2pkTags.NSigsRefund = int(nsigr)
 		}
 	}
 
@@ -366,56 +383,65 @@ func VerifyP2PKLockedProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret)
 	}
 
 	signaturesRequired := 1
-	// if locktime is expired and there is no refund pubkey, treat as anyone can spend
-	// if refund pubkey present, check signature
+	// NUT-11/14 semantics: locktime expiry ADDS the refund keys as an
+	// alternative spending path — it does NOT revoke the primary path
+	// (cashu-audit #59: primary-after-expiry must still be accepted; the
+	// reference field — cdk, nutshell >=0.20.3 — accepts both).
 	if p2pkTags.Locktime > 0 && time.Now().Local().Unix() > p2pkTags.Locktime {
 		if len(p2pkTags.Refund) == 0 {
+			// no refund keys: anyone can spend after expiry
 			return nil
-		} else {
+		}
+		if len(p2pkWitness.Signatures) >= 1 {
 			hash := sha256.Sum256([]byte(proof.Secret))
-			if len(p2pkWitness.Signatures) < 1 {
-				return InvalidWitness
+			// NUT-11: n_sigs_refund sets the refund-path signature
+			// threshold (default 1).
+			refundRequired := 1
+			if p2pkTags.NSigsRefund > 0 {
+				refundRequired = p2pkTags.NSigsRefund
 			}
-			if !HasValidSignatures(hash[:], p2pkWitness.Signatures, signaturesRequired, p2pkTags.Refund) {
-				return NotEnoughSignaturesErr
-			}
-		}
-	} else {
-		pubkey, err := ParsePublicKey(proofSecret.Data.Data)
-		if err != nil {
-			return err
-		}
-		keys := []*btcec.PublicKey{pubkey}
-		// message to sign
-		hash := sha256.Sum256([]byte(proof.Secret))
-
-		if p2pkTags.NSigs > 0 {
-			signaturesRequired = p2pkTags.NSigs
-			// NUT-11: the signable key set is the primary key (secret.data)
-			// UNION the optional `pubkeys` tag. A separate pubkeys tag is NOT
-			// required when n_sigs is present — n_sigs:1 with only the data
-			// key is the canonical single-key lock every reference wallet
-			// emits (cashu-audit #59 P1 shape-1: well-formed P2PK proofs were
-			// rejected with EmptyPubkeysErr on BOTH swap and melt paths).
-			if len(p2pkTags.Pubkeys) > 0 {
-				keys = append(keys, p2pkTags.Pubkeys...)
-			}
-			if signaturesRequired > len(keys) {
-				return NotEnoughSignaturesErr
+			if HasValidSignatures(hash[:], p2pkWitness.Signatures, refundRequired, p2pkTags.Refund) {
+				return nil
 			}
 		}
+		// refund path did not verify — fall through to the primary path
+	}
 
-		if len(p2pkWitness.Signatures) < 1 {
-			return InvalidWitness
+	pubkey, err := ParsePublicKey(proofSecret.Data.Data)
+	if err != nil {
+		return err
+	}
+	keys := []*btcec.PublicKey{pubkey}
+	// message to sign
+	hash := sha256.Sum256([]byte(proof.Secret))
+
+	if p2pkTags.NSigs > 0 {
+		signaturesRequired = p2pkTags.NSigs
+		// NUT-11: the signable key set is the primary key (secret.data)
+		// UNION the optional `pubkeys` tag. A separate pubkeys tag is NOT
+		// required when n_sigs is present — n_sigs:1 with only the data
+		// key is the canonical single-key lock every reference wallet
+		// emits (cashu-audit #59 P1 shape-1: well-formed P2PK proofs were
+		// rejected with EmptyPubkeysErr on BOTH swap and melt paths).
+		if len(p2pkTags.Pubkeys) > 0 {
+			keys = append(keys, p2pkTags.Pubkeys...)
 		}
-
-		if DuplicateSignatures(p2pkWitness.Signatures) {
-			return DuplicateSignaturesErr
-		}
-
-		if !HasValidSignatures(hash[:], p2pkWitness.Signatures, signaturesRequired, keys) {
+		if signaturesRequired > len(keys) {
 			return NotEnoughSignaturesErr
 		}
 	}
+
+	if len(p2pkWitness.Signatures) < 1 {
+		return InvalidWitness
+	}
+
+	if DuplicateSignatures(p2pkWitness.Signatures) {
+		return DuplicateSignaturesErr
+	}
+
+	if !HasValidSignatures(hash[:], p2pkWitness.Signatures, signaturesRequired, keys) {
+		return NotEnoughSignaturesErr
+	}
+
 	return nil
 }
