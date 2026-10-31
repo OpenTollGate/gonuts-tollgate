@@ -3,6 +3,8 @@ package mint
 import (
 	"bytes"
 	"encoding/json"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
+	"github.com/OpenTollGate/gonuts-tollgate/mint/lightning"
 	"io"
 	"log/slog"
 	"net/http"
@@ -211,5 +213,65 @@ func TestGetKeysetByIdHandler(t *testing.T) {
 				t.Fatal("responses do not match")
 			}
 		})
+	}
+}
+
+func TestMeltTokensReplayCache(t *testing.T) {
+	fakeBackend := &lightning.FakeBackend{}
+	m, err := LoadMint(Config{
+		MintPath:        t.TempDir(),
+		LightningClient: fakeBackend,
+		LogLevel:        Disable,
+	})
+	if err != nil {
+		t.Fatalf("error loading mint: %v", err)
+	}
+	ms := MintServer{mint: m, cache: NewCache()}
+
+	// one melt quote + proofs covering it
+	invoice, err := fakeBackend.CreateInvoice(8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quote, err := m.RequestMeltQuote(nut05.PostMeltQuoteBolt11Request{
+		Request: invoice.PaymentRequest,
+		Unit:    cashu.Sat.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	spendable := internalTestProofs(t, m, 2)
+	requestBody, err := json.Marshal(nut05.PostMeltBolt11Request{
+		Quote:  quote.Id,
+		Inputs: spendable,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doPost := func() *httptest.ResponseRecorder {
+		req, err := http.NewRequest(http.MethodPost, "/v1/melt/bolt11", bytes.NewReader(requestBody))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req = mux.SetURLVars(req, map[string]string{"method": cashu.BOLT11_METHOD})
+		w := httptest.NewRecorder()
+		ms.meltTokens(w, req)
+		return w
+	}
+
+	w1 := doPost()
+	if w1.Code != http.StatusOK {
+		t.Fatalf("first melt must succeed, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// replay: byte-identical cached response, not MELT_ALREADY_PAID
+	w2 := doPost()
+	if w2.Code != http.StatusOK {
+		t.Fatalf("replayed melt must return the cached 200, got %d: %s", w2.Code, w2.Body.String())
+	}
+	if !bytes.Equal(w1.Body.Bytes(), w2.Body.Bytes()) {
+		t.Fatalf("replayed melt must be byte-identical:\nfirst:  %s\nreplay: %s", w1.Body.String(), w2.Body.String())
 	}
 }

@@ -677,10 +677,28 @@ func (ms *MintServer) meltTokens(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var meltTokensRequest nut05.PostMeltBolt11Request
-	err := decodeJsonReqBody(req, &meltTokensRequest)
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
+		ms.writeErr(rw, req, cashu.StandardErr)
+		return
+	}
+
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	var meltTokensRequest nut05.PostMeltBolt11Request
+	if err := decodeJsonReqBody(req, &meltTokensRequest); err != nil {
 		ms.writeErr(rw, req, err)
+		return
+	}
+
+	// NUT-19 replay cache: a byte-identical melt re-POST returns the
+	// cached response. Without this, a client that lost the first
+	// response gets an ambiguous MELT_ALREADY_PAID error and cannot tell
+	// whether its melt settled (cashu-audit #59 P3).
+	response, found := ms.cache.Get(req.Method + req.URL.String() + string(body))
+	if found {
+		ms.mint.logDebugf("returning cached response for melt tokens request on quote '%v'", meltTokensRequest.Quote)
+		ms.logRequest(req, http.StatusOK, "returning cached response on melt tokens request")
+		rw.Write(response)
 		return
 	}
 
@@ -729,6 +747,12 @@ func (ms *MintServer) meltTokens(rw http.ResponseWriter, req *http.Request) {
 
 	ms.logRequest(req, http.StatusOK,
 		"return from melt tokens for quote '%v'. Quote state: %s", meltQuote.Id, meltQuote.State)
+
+	// NUT-19: cache the successful response for replay (same key shape
+	// as the mint handler; bounded by request size).
+	if len(body) < REQUEST_BODY_SIZE_LIMIT {
+		ms.cache.Set(req.Method+req.URL.String()+string(body), jsonRes, time.Second*CACHE_ITEM_TTL)
+	}
 
 	rw.Write(jsonRes)
 }

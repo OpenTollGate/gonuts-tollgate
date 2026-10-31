@@ -1666,6 +1666,7 @@ func (m *Mint) SetMintInfo(mintInfo MintInfo) {
 			CachedEndpoints: []nut06.CachedEndpoint{
 				{Method: "POST", Path: "/v1/mint/bolt11"},
 				{Method: "POST", Path: "/v1/swap"},
+				{Method: "POST", Path: "/v1/melt/bolt11"},
 			},
 		},
 		Nut20: nut06.Supported{Supported: true},
