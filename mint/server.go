@@ -189,8 +189,10 @@ func (ms *MintServer) setupHttpServer(port int) {
 	r.HandleFunc("/v1/keysets", ms.getKeysetsList).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/keys/{id}", ms.getKeysetById).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/mint/quote/{method}", ms.mintRequest).Methods(http.MethodGet, http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/mint/quote/{method}/check", ms.mintQuoteBatchCheck).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/mint/quote/{method}/{quote_id}", ms.mintQuoteState).Methods(http.MethodGet, http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/mint/{method}", ms.mintTokensRequest).Methods(http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/mint/{method}/batch", ms.mintTokensBatchRequest).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/swap", ms.swapRequest).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/melt/quote/{method}", ms.meltQuoteRequest).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/melt/quote/{method}/{quote_id}", ms.meltQuoteState).Methods(http.MethodGet, http.MethodOptions)
@@ -873,4 +875,92 @@ func decodeJsonReqBody(req *http.Request, dst any) error {
 	}
 
 	return nil
+}
+
+// mintQuoteBatchCheck handles NUT-29 POST /v1/mint/quote/{method}/check:
+// states for a batch of quote ids, request order, all-or-nothing.
+func (ms *MintServer) mintQuoteBatchCheck(rw http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	if vars["method"] != cashu.BOLT11_METHOD {
+		ms.writeErr(rw, req, cashu.PaymentMethodNotSupportedErr)
+		return
+	}
+
+	var batchReq struct {
+		Quotes []string `json:"quotes"`
+	}
+	if err := decodeJsonReqBody(req, &batchReq); err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	quotes, err := ms.mint.CheckMintQuotesBatch(batchReq.Quotes)
+	if err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	responses := make([]nut04.PostMintQuoteBolt11Response, len(quotes))
+	for i, quote := range quotes {
+		responses[i] = nut04.PostMintQuoteBolt11Response{
+			Quote:        quote.Id,
+			Request:      quote.PaymentRequest,
+			Amount:       quote.Amount,
+			Unit:         cashu.Sat.String(),
+			State:        quote.State,
+			Expiry:       quote.Expiry,
+			AmountPaid:   amountPaidFromState(quote),
+			AmountIssued: amountIssuedFromState(quote),
+			UpdatedAt:    uint64(time.Now().Unix()),
+		}
+		if quote.Pubkey != nil {
+			responses[i].Pubkey = hex.EncodeToString(quote.Pubkey.SerializeCompressed())
+		}
+	}
+
+	jsonRes, err := json.Marshal(&responses)
+	if err != nil {
+		ms.writeErr(rw, req, cashu.StandardErr)
+		return
+	}
+	ms.logRequest(req, http.StatusOK, "returning batch check for %d quotes", len(quotes))
+	rw.Write(jsonRes)
+}
+
+// mintTokensBatchRequest handles NUT-29 POST /v1/mint/{method}/batch: an
+// atomic consolidated mint across multiple paid quotes.
+func (ms *MintServer) mintTokensBatchRequest(rw http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	if vars["method"] != cashu.BOLT11_METHOD {
+		ms.writeErr(rw, req, cashu.PaymentMethodNotSupportedErr)
+		return
+	}
+
+	var batchReq struct {
+		Quotes     []string              `json:"quotes"`
+		Outputs    cashu.BlindedMessages `json:"outputs"`
+		Signatures []string              `json:"signatures"`
+		_          struct {
+			QuoteAmounts []uint64 `json:"quote_amounts"`
+		} `json:"-"`
+	}
+	if err := decodeJsonReqBody(req, &batchReq); err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	blindedSignatures, err := ms.mint.MintTokensBatch(batchReq.Quotes, batchReq.Outputs, batchReq.Signatures)
+	if err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	signatures := nut04.PostMintBolt11Response{Signatures: blindedSignatures}
+	jsonRes, err := json.Marshal(&signatures)
+	if err != nil {
+		ms.writeErr(rw, req, cashu.StandardErr)
+		return
+	}
+	ms.logRequest(req, http.StatusOK, "returning signatures for batch mint of %d quotes", len(batchReq.Quotes))
+	rw.Write(jsonRes)
 }

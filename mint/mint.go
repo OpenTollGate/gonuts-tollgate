@@ -380,11 +380,180 @@ func (m *Mint) GetMintQuoteState(quoteId string) (storage.MintQuote, error) {
 
 // MintTokens verifies whether the mint quote with id has been paid and proceeds to
 // sign the blindedMessages and return the BlindedSignatures if it was paid.
-	// mintQuoteClaimBarrier is a test seam (the postMeltBolt11 pattern):
+// mintQuoteClaimBarrier is a test seam (the postMeltBolt11 pattern):
 // invoked between the quote read and the Paid->Pending CAS claim in
 // MintTokens, so tests can deterministically stage both callers past the
 // read before either claims — the double-issuance race window.
 var mintQuoteClaimBarrier = func() {}
+
+// Batch limits (NUT-29: implementations MAY impose maximum batch sizes).
+const (
+	BatchCheckLimit = 50
+	BatchMaxOutputs = 1000
+)
+
+// MintTokensBatch atomically mints a consolidated output set against
+// multiple PAID bolt11 quotes (NUT-29). All-or-nothing: every quote is
+// claimed (Paid->Pending CAS) before any signing; any failure rolls every
+// claim back (Pending->Paid, releasing only claims WE hold) so the batch
+// is retryable. NUT-20 locked quotes are signed per-quote over
+// quotes[i] + the FULL consolidated outputs (nuts/29.md).
+func (m *Mint) MintTokensBatch(quoteIds []string, outputs cashu.BlindedMessages, signatures []string) (cashu.BlindedSignatures, error) {
+	if len(quoteIds) == 0 {
+		return nil, cashu.NoProofsProvided
+	}
+	if len(outputs) > BatchMaxOutputs {
+		return nil, cashu.BuildCashuError(
+			fmt.Sprintf("too many outputs: max %d", BatchMaxOutputs), cashu.StandardErrCode)
+	}
+
+	// validation rule 2: unique quote ids
+	seen := make(map[string]bool, len(quoteIds))
+	for _, id := range quoteIds {
+		if seen[id] {
+			return nil, cashu.DuplicateQuotesErr
+		}
+		seen[id] = true
+	}
+
+	// fetch every quote up front (all-or-nothing: unknown id rejects the
+	// whole batch before anything is claimed)
+	quotes := make([]storage.MintQuote, len(quoteIds))
+	totalAmount := uint64(0)
+	for i, id := range quoteIds {
+		quote, err := m.GetMintQuoteState(id)
+		if err != nil {
+			return nil, err
+		}
+		if quote.State != nut04.Paid {
+			return nil, cashu.MintQuoteRequestNotPaid
+		}
+		quotes[i] = quote
+		totalAmount += quote.Amount
+	}
+
+	// outputs validation (rule 7, bolt11: sum(outputs) == sum(quotes))
+	outputsAmount, err := outputs.AmountChecked()
+	if err != nil {
+		return nil, cashu.InvalidBlindedMessageAmount
+	}
+	if cashu.CheckDuplicateBlindedMessages(outputs) {
+		return nil, cashu.DuplicateOutputs
+	}
+	if outputsAmount != totalAmount {
+		return nil, cashu.OutputsOverQuoteAmountErr
+	}
+
+	// NUT-20: if any quote is locked, signatures[i] must verify over
+	// quotes[i] + the full consolidated outputs (dual-accept framing).
+	anyLocked := false
+	for _, q := range quotes {
+		if q.Pubkey != nil {
+			anyLocked = true
+			break
+		}
+	}
+	if anyLocked && len(signatures) != len(quoteIds) {
+		return nil, cashu.MintQuoteInvalidSigErr
+	}
+
+	// claim every quote (Paid -> Pending). On any loss/failure, roll back
+	// the claims already taken.
+	claimed := make([]string, 0, len(quotes))
+	rollbackClaims := func() {
+		for _, id := range claimed {
+			if released, rbErr := m.db.UpdateMintQuoteStateCAS(id, nut04.Pending, nut04.Paid); rbErr != nil || !released {
+				m.logErrorf("batch mint rollback did not release quote '%v' (released=%v, err=%v) — quote may rest PENDING", id, released, rbErr)
+			}
+		}
+	}
+	for i, q := range quotes {
+		if q.Pubkey != nil {
+			sigHex := signatures[i]
+			if sigHex == "" {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+			sigBytes, err := hex.DecodeString(sigHex)
+			if err != nil {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+			sig, err := schnorr.ParseSignature(sigBytes)
+			if err != nil {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+			if !nut20.VerifyMintQuoteSignature(sig, q.Id, outputs, q.Pubkey) {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+		}
+		claimedOk, err := m.db.UpdateMintQuoteStateCAS(q.Id, nut04.Paid, nut04.Pending)
+		if err != nil {
+			rollbackClaims()
+			errmsg := fmt.Sprintf("error claiming mint quote '%v': %v", q.Id, err)
+			return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+		}
+		if !claimedOk {
+			rollbackClaims()
+			return nil, cashu.QuotePending
+		}
+		claimed = append(claimed, q.Id)
+	}
+
+	// sign the consolidated outputs once
+	blindedSignatures, err := m.signBlindedMessages(outputs)
+	if err != nil {
+		rollbackClaims()
+		return nil, err
+	}
+
+	// persist signatures, then mark every quote Issued (claim-holder only)
+	B_s := make([]string, len(outputs))
+	for i, bm := range outputs {
+		B_s[i] = bm.B_
+	}
+	if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
+		rollbackClaims()
+		errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
+		return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	}
+	for _, q := range quotes {
+		issued, err := m.db.UpdateMintQuoteStateCAS(q.Id, nut04.Pending, nut04.Issued)
+		if err != nil || !issued {
+			rollbackClaims()
+			errmsg := fmt.Sprintf("quote '%v' left PENDING before batch issuance completed (issued=%v, err=%v)", q.Id, issued, err)
+			return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+		}
+		jsonQuote, _ := json.Marshal(q)
+		m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
+	}
+
+	return blindedSignatures, nil
+}
+
+// CheckMintQuotesBatch returns the states of the given bolt11 mint quotes
+// in request order (NUT-29 batch check). All-or-nothing: an unknown id
+// rejects the whole request.
+func (m *Mint) CheckMintQuotesBatch(quoteIds []string) ([]storage.MintQuote, error) {
+	if len(quoteIds) == 0 {
+		return nil, cashu.NoProofsProvided
+	}
+	if len(quoteIds) > BatchCheckLimit {
+		return nil, cashu.BuildCashuError(
+			fmt.Sprintf("batch too large: max %d quote ids", BatchCheckLimit), cashu.StandardErrCode)
+	}
+	quotes := make([]storage.MintQuote, len(quoteIds))
+	for i, id := range quoteIds {
+		quote, err := m.GetMintQuoteState(id)
+		if err != nil {
+			return nil, err
+		}
+		quotes[i] = quote
+	}
+	return quotes, nil
+}
 
 func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.BlindedSignatures, error) {
 	// NUT #04: The total output amount **MUST NOT** exceed the quote's currently mintable amount, `amount_paid - amount_issued`.
@@ -1670,6 +1839,11 @@ func (m *Mint) SetMintInfo(mintInfo MintInfo) {
 			},
 		},
 		Nut20: nut06.Supported{Supported: true},
+		Nut29: nut06.Nut29Setting{
+			Supported:           true,
+			MaxBatchSize:        BatchCheckLimit,
+			MaxBatchOutputsSize: BatchMaxOutputs,
+		},
 	}
 
 	if m.mppEnabled {

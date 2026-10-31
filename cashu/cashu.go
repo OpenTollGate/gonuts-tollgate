@@ -525,6 +525,8 @@ const (
 	MeltQuoteErrCode CashuErrCode = 20009
 	// NUT-04: quote amounts MUST be positive integers.
 	MintQuoteZeroAmountErrCode CashuErrCode = 20010
+	// NUT-29: duplicate quote ids in a batch (nuts/29.md validation rule 2).
+	DuplicateQuotesErrCode CashuErrCode = 11016
 )
 
 var (
@@ -541,6 +543,7 @@ var (
 	MintingDisabled              = Error{Detail: "minting is disabled", Code: MintingDisabledErrCode}
 	MintAmountExceededErr        = Error{Detail: "max amount for minting exceeded", Code: AmountLimitExceeded}
 	MintQuoteZeroAmountErr       = Error{Detail: "quote amount must be a positive integer", Code: MintQuoteZeroAmountErrCode}
+	DuplicateQuotesErr           = Error{Detail: "duplicate quote ids in batch", Code: DuplicateQuotesErrCode}
 	MintQuoteInvalidSigErr       = Error{Detail: "Mint quote with pubkey but no valid signature provided.", Code: MintQuoteInvalidSigErrCode}
 	OutputsOverQuoteAmountErr    = Error{Detail: "sum of the output amounts is greater than quote amount", Code: StandardErrCode}
 	ProofAlreadyUsedErr          = Error{Detail: "proof already used", Code: ProofAlreadyUsedErrCode}
