@@ -555,6 +555,24 @@ func (m *Mint) CheckMintQuotesBatch(quoteIds []string) ([]storage.MintQuote, err
 	return quotes, nil
 }
 
+// storedSignaturesFor reports whether the FULL output set is already
+// signed in the db and returns those signatures — the retry/recovery
+// signal for a Pending or Issued quote (a partial match is not a retry).
+func (m *Mint) storedSignaturesFor(outputs cashu.BlindedMessages) (cashu.BlindedSignatures, bool) {
+	if len(outputs) == 0 {
+		return nil, false
+	}
+	B_s := make([]string, len(outputs))
+	for i, bm := range outputs {
+		B_s[i] = bm.B_
+	}
+	sigs, err := m.db.GetBlindSignatures(B_s)
+	if err != nil || len(sigs) != len(outputs) {
+		return nil, false
+	}
+	return sigs, true
+}
+
 func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.BlindedSignatures, error) {
 	// NUT #04: The total output amount **MUST NOT** exceed the quote's currently mintable amount, `amount_paid - amount_issued`.
 	mintQuote, err := m.GetMintQuoteState(mintTokensRequest.Quote)
@@ -564,10 +582,32 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 
 	var blindedSignatures cashu.BlindedSignatures
 
+	// NUT-19/recovery: for Pending and Issued quotes, if the FULL output
+	// set is already signed in the db, this is a retry of a mint that
+	// completed (or crashed after SaveBlindSignatures but before the
+	// Issued write) — replay the stored signatures and complete the state
+	// machine instead of erroring (cashu-audit #59 crash-consistency: the
+	// client must be able to learn its signatures after any crash point).
+	if mintQuote.State == nut04.Pending || mintQuote.State == nut04.Issued {
+		if stored, ok := m.storedSignaturesFor(mintTokensRequest.Outputs); ok {
+			if mintQuote.State == nut04.Pending {
+				// crash window: signatures saved, Issued write lost — finish it
+				if issued, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Pending, nut04.Issued); err != nil || !issued {
+					m.logErrorf("mint quote '%v' recovery could not complete Pending->Issued (issued=%v, err=%v)", mintQuote.Id, issued, err)
+				}
+			}
+			m.logDebugf("replaying stored signatures for mint quote '%v' (state %v)", mintQuote.Id, mintQuote.State)
+			return stored, nil
+		}
+	}
+
 	switch mintQuote.State {
 	case nut04.Unpaid:
 		return nil, cashu.MintQuoteRequestNotPaid
 	case nut04.Issued:
+		// Issued with NO stored signatures for these outputs: the
+		// pre-saga crash shape — value stranded, needs operator recovery.
+		m.logErrorf("mint quote '%v' is ISSUED but its signatures are not recoverable for these outputs", mintQuote.Id)
 		return nil, cashu.MintQuoteAlreadyIssued
 	case nut04.Pending:
 		return nil, cashu.QuotePending
@@ -650,7 +690,17 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 				return err
 			}
 
-			// mark quote as issued after signing the blinded messages —
+			// CRASH-CONSISTENCY ORDER (cashu-audit #59 saga): persist the
+			// signatures BEFORE the Issued write. A crash between the two
+			// leaves the quote Pending with recoverable signatures — the
+			// retry replays them and completes Pending->Issued (see the
+			// recovery head in MintTokens). The old order (Issued first)
+			// stranded the quote Issued with nothing deliverable.
+			if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
+				errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
+				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+			}
+
 			// Pending->Issued conditionally: only the claim-holder reaches
 			// here, so a loss means unexpected concurrent state surgery.
 			mintQuote.State = nut04.Issued
@@ -662,10 +712,6 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 			if !issued {
 				m.logErrorf("mint quote '%v' left PENDING before its claim-holder could mark it ISSUED — concurrent writer detected", mintQuote.Id)
 				return cashu.BuildCashuError("mint quote state changed underneath issuance", cashu.DBErrCode)
-			}
-			if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
-				errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
-				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
 
 			jsonQuote, _ := json.Marshal(mintQuote)

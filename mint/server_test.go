@@ -453,3 +453,96 @@ func payQuoteLocked(t *testing.T, m *Mint, amount uint64, pubkey *btcec.PublicKe
 	}
 	return quote
 }
+
+// TestMintTokensCrashRecovery stages the crash points of the mint saga
+// (cashu-audit #59 crash-consistency) by db state manipulation — the
+// in-process equivalent of kill/restart between the saga's writes:
+//
+//	crash after SaveBlindSignatures, before Issued  -> Pending + sigs stored
+//	crash after Issued                              -> Issued + sigs stored
+//	the pre-saga stranded shape                      -> Issued + no sigs
+func TestMintTokensCrashRecovery(t *testing.T) {
+	fakeBackend := &lightning.FakeBackend{}
+	m, err := LoadMint(Config{
+		MintPath:        t.TempDir(),
+		LightningClient: fakeBackend,
+		LogLevel:        Disable,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newPaidQuoteWithOutputs := func(amount uint64) (storage.MintQuote, cashu.BlindedMessages) {
+		quote, err := m.RequestMintQuote(nut04.PostMintQuoteBolt11Request{Amount: amount, Unit: cashu.Sat.String()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.GetMintQuoteState(quote.Id); err != nil {
+			t.Fatal(err)
+		}
+		amounts := cashu.AmountSplit(amount)
+		outputs, _, _ := internalTestOutputsAmounts(m.GetActiveKeyset().Id, amounts)
+		return quote, outputs
+	}
+
+	// happy-path mint first (baseline), then stage the crash windows
+	q1, outs1 := newPaidQuoteWithOutputs(8)
+	sigs1, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: q1.Id, Outputs: outs1})
+	if err != nil {
+		t.Fatalf("baseline mint must succeed: %v", err)
+	}
+
+	// (2) crash after Issued: replay the settled quote — stored sigs, byte-equal
+	sigs1b, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: q1.Id, Outputs: outs1})
+	if err != nil {
+		t.Fatalf("retry of an issued quote with stored signatures must replay them: %v", err)
+	}
+	if len(sigs1b) != len(sigs1) {
+		t.Fatalf("replayed signature count mismatch: %d vs %d", len(sigs1b), len(sigs1))
+	}
+	for i := range sigs1 {
+		if sigs1[i].C_ != sigs1b[i].C_ {
+			t.Fatalf("replayed signature %d differs from the original", i)
+		}
+	}
+
+	// (1) crash between SaveBlindSignatures and Issued: stage Pending +
+	// stored sigs by minting a second quote and forcing its state back
+	q2, outs2 := newPaidQuoteWithOutputs(8)
+	sigs2, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: q2.Id, Outputs: outs2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.db.UpdateMintQuoteState(q2.Id, nut04.Pending); err != nil {
+		t.Fatal(err)
+	}
+	sigs2b, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: q2.Id, Outputs: outs2})
+	if err != nil {
+		t.Fatalf("recovery from the save-before-issued crash window must replay signatures: %v", err)
+	}
+	for i := range sigs2 {
+		if sigs2[i].C_ != sigs2b[i].C_ {
+			t.Fatalf("recovered signature %d differs", i)
+		}
+	}
+	q2Final, err := m.GetMintQuoteState(q2.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q2Final.State != nut04.Issued {
+		t.Fatalf("recovery must complete Pending->Issued, got %v", q2Final.State)
+	}
+
+	// (3) the pre-saga stranded shape: Issued with no stored signatures
+	q3, outs3 := newPaidQuoteWithOutputs(8)
+	if _, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: q3.Id, Outputs: outs3}); err != nil {
+		t.Fatal(err)
+	}
+	q4, outs4 := newPaidQuoteWithOutputs(8)
+	if err := m.db.UpdateMintQuoteState(q4.Id, nut04.Issued); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: q4.Id, Outputs: outs4}); err == nil {
+		t.Fatal("issued quote with no stored signatures must NOT mint (the stranded shape needs operator recovery)")
+	}
+}
