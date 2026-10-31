@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Handle positive NUT-08 fee change assigned to blank melt outputs, including
+  partial change responses, while preserving strict swap/mint amount binding.
+- Recover paid melt change from the existing quote before considering another
+  melt POST; persist the paid quote and retire its pending inputs on recovery.
+
 ## [v0.15.0] - 2026-10-28
 
 ### Added

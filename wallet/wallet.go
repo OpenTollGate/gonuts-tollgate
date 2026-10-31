@@ -1336,11 +1336,11 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		// here: the whole blank-output range was already reserved before the
 		// request was sent, and the change signatures live inside it.
 		if change > 0 {
-			changeProofs, err := constructProofs(
+			changeProofs, err := constructMeltChangeProofs(
 				meltBolt11Response.Change,
-				outputs[:change],
-				outputsSecrets[:change],
-				outputsRs[:change],
+				outputs,
+				outputsSecrets,
+				outputsRs,
 				activeKeyset,
 			)
 			if err != nil {
@@ -2174,7 +2174,25 @@ func blindedMessagesFromSpendingCondition(
 	return blindedMessages, secrets, rs, nil
 }
 
-// constructProofs unblinds the blindedSignatures and returns the proofs
+// constructMeltChangeProofs handles NUT-08: the mint assigns amounts to
+// zero-valued blank outputs and may return only a prefix. Keep that exception
+// at the melt boundary; swap/mint response amount binding remains strict.
+func constructMeltChangeProofs(signatures cashu.BlindedSignatures, messages cashu.BlindedMessages, secrets []string, rs []*secp256k1.PrivateKey, keyset *crypto.WalletKeyset) (cashu.Proofs, error) {
+	n := len(signatures)
+	if n > len(messages) || n > len(secrets) || n > len(rs) {
+		return nil, errors.New("melt change exceeds supplied blank outputs")
+	}
+	assigned := append(cashu.BlindedMessages(nil), messages[:n]...)
+	for i, sig := range signatures {
+		if assigned[i].Amount != 0 || sig.Amount == 0 {
+			return nil, errors.New("melt change must assign positive amounts to blank outputs")
+		}
+		assigned[i].Amount = sig.Amount
+	}
+	return constructProofs(signatures, assigned, secrets[:n], rs[:n], keyset)
+}
+
+// constructProofs unblinds the blindedSignatures and returns the proofs.
 func constructProofs(
 	blindedSignatures cashu.BlindedSignatures,
 	blindedMessages cashu.BlindedMessages,
