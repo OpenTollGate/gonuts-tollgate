@@ -277,6 +277,12 @@ func (m *Mint) RequestMintQuote(mintQuoteRequest nut04.PostMintQuoteBolt11Reques
 
 	// check limits
 	requestAmount := mintQuoteRequest.Amount
+	// NUT-04: the amount MUST be a positive integer — a zero-amount quote
+	// is malformed (cashu-audit #59 P2 hygiene; previously a 0-sat
+	// invoice and an immediately-satisfiable quote were issued).
+	if requestAmount == 0 {
+		return storage.MintQuote{}, cashu.MintQuoteZeroAmountErr
+	}
 	if m.limits.MintingSettings.MaxAmount > 0 {
 		if requestAmount > m.limits.MintingSettings.MaxAmount {
 			return storage.MintQuote{}, cashu.MintAmountExceededErr

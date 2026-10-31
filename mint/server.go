@@ -233,6 +233,16 @@ func amountPaidFromState(quote storage.MintQuote) uint64 {
 	return 0
 }
 
+// amountIssuedFromState derives the NUT-04 amount_issued field: the
+// quote amount once the state is ISSUED (gonuts quotes are single-shot —
+// outputs are validated against the full amount at mint time).
+func amountIssuedFromState(quote storage.MintQuote) uint64 {
+	if quote.State == nut04.Issued {
+		return quote.Amount
+	}
+	return 0
+}
+
 func (ms *MintServer) logRequest(req *http.Request, statusCode int, format string, args ...any) {
 	// this is done to preserve the source position in the log msg from where this
 	// method is called. Otherwise all messages would be logged with
@@ -379,7 +389,7 @@ func (ms *MintServer) mintRequest(rw http.ResponseWriter, req *http.Request) {
 		State:        mintQuote.State,
 		Expiry:       mintQuote.Expiry,
 		AmountPaid:   amountPaidFromState(mintQuote),
-		AmountIssued: 0,
+		AmountIssued: amountIssuedFromState(mintQuote),
 		UpdatedAt:    uint64(time.Now().Unix()),
 	}
 	if mintQuote.Pubkey != nil {
@@ -429,7 +439,7 @@ func (ms *MintServer) mintQuoteState(rw http.ResponseWriter, req *http.Request) 
 		State:        mintQuote.State,
 		Expiry:       mintQuote.Expiry,
 		AmountPaid:   amountPaidFromState(mintQuote),
-		AmountIssued: 0,
+		AmountIssued: amountIssuedFromState(mintQuote),
 		UpdatedAt:    uint64(time.Now().Unix()),
 	}
 	if mintQuote.Pubkey != nil {
