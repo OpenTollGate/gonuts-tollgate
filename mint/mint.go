@@ -533,10 +533,13 @@ func (m *Mint) Swap(proofs cashu.Proofs, blindedMessages cashu.BlindedMessages) 
 		return nil, cashu.BlindedMessageAlreadySigned
 	}
 
-	// if sig all, verify signatures in blinded messages
+	// if sig all, verify the first-input aggregate witness per NUT-11
+	// (tollgate #809: the per-output witness lane was non-spec; spec
+	// wallets put the signature over the aggregated swap message in the
+	// FIRST input only)
 	if nut11.ProofsSigAll(proofs) {
-		m.logDebugf("locked proofs have SIG_ALL flag. Verifying blinded messages")
-		if err := verifyBlindedMessages(proofs, blindedMessages); err != nil {
+		m.logDebugf("locked proofs have SIG_ALL flag. Verifying first-input aggregate witness")
+		if err := nut11.VerifySigAllProofs(proofs, blindedMessages, ""); err != nil {
 			return nil, err
 		}
 	}
@@ -810,8 +813,16 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 		return storage.MeltQuote{}, cashu.InsufficientProofsAmount
 	}
 
+	// NUT-11 SIG_ALL melts are spec-legal: the witness lives in the first
+	// input and signs the aggregate of inputs + NUT-08 blank outputs +
+	// quote id. Verified here — before the quote CAS, so a bad witness can
+	// never claim the quote (fund-safety: local validation precedes
+	// irreversible state changes). tollgate #809 / cashu-audit #59 P1.
 	if nut11.ProofsSigAll(proofs) {
-		return storage.MeltQuote{}, nut11.SigAllOnlySwap
+		if err := nut11.VerifySigAllProofs(proofs, meltTokensRequest.Outputs, meltQuote.Id); err != nil {
+			return storage.MeltQuote{}, err
+		}
+		m.logDebugf("verified SIG_ALL melt witness (aggregate + quote id)")
 	}
 
 	m.logInfof("verified proofs in melt tokens request. Claiming quote via CAS before attempting payment.")
@@ -861,14 +872,8 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 		if err != nil {
 			return storage.MeltQuote{}, err
 		}
-		err := m.db.RemovePendingProofs(Ys)
-		if err != nil {
-			errmsg := fmt.Sprintf("error removing pending proofs: %v", err)
-			return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
-		}
-		err = m.db.SaveProofs(proofs)
-		if err != nil {
-			errmsg := fmt.Sprintf("error invalidating proofs. Could not save proofs to db: %v", err)
+		if err := m.db.SettleProofs(Ys, proofs); err != nil {
+			errmsg := fmt.Sprintf("error settling proofs (pending->used must be atomic): %v", err)
 			return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 		}
 		m.publishProofsStateChanges(proofs, nut07.Spent)
@@ -1020,14 +1025,8 @@ func (m *Mint) settleQuotesInternally(
 // settleProofs will remove the proofs from the pending table
 // and mark them as spent by adding them to the used proofs table
 func (m *Mint) settleProofs(Ys []string, proofs cashu.Proofs) error {
-	err := m.db.RemovePendingProofs(Ys)
-	if err != nil {
-		errmsg := fmt.Sprintf("error removing pending proofs: %v", err)
-		return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
-	}
-	err = m.db.SaveProofs(proofs)
-	if err != nil {
-		errmsg := fmt.Sprintf("error invalidating proofs. Could not save proofs to db: %v", err)
+	if err := m.db.SettleProofs(Ys, proofs); err != nil {
+		errmsg := fmt.Sprintf("error settling proofs (pending->used must be atomic): %v", err)
 		return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 	m.publishProofsStateChanges(proofs, nut07.Spent)
@@ -1180,7 +1179,12 @@ func (m *Mint) verifyProofs(proofs cashu.Proofs, Ys []string) error {
 		// if P2PK locked proof, verify valid witness
 		nut10Secret, err := nut10.DeserializeSecret(proof.Secret)
 		if err == nil {
-			if nut10Secret.Kind == nut10.P2PK {
+			if nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
+				// SIG_ALL witnesses live only in the FIRST input and sign
+				// the aggregated transaction message — verified as a group
+				// by the caller (VerifySigAllProofs), not per-input here.
+				m.logDebugf("SIG_ALL input — deferring to group verification")
+			} else if nut10Secret.Kind == nut10.P2PK {
 				if err := nut11.VerifyP2PKLockedProof(proof, nut10Secret); err != nil {
 					return err
 				}
@@ -1211,8 +1215,12 @@ func (m *Mint) verifyProofs(proofs cashu.Proofs, Ys []string) error {
 	return nil
 }
 
-// verifyBlindedMessages used to verify blinded messages are signed when SIG_ALL flag
-// is present in either a P2PK or HTLC locked proofs
+// verifyBlindedMessages verified per-output witnesses on BlindedMessages —
+// a NON-SPEC construction gonuts invented (witnesses are defined on Proofs
+// only; SIG_ALL signs the aggregated transaction message in the FIRST
+// input). DEPRECATED and no longer called since the tollgate #809
+// alignment: kept one release for reference, removed next cut. Output
+// witnesses carried by requests are ignored by the mint.
 func verifyBlindedMessages(proofs cashu.Proofs, blindedMessages cashu.BlindedMessages) error {
 	secret, err := nut10.DeserializeSecret(proofs[0].Secret)
 	if err != nil {
