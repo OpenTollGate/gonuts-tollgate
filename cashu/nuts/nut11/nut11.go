@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
@@ -48,6 +49,9 @@ var (
 	SigAllKeysMustBeEqualErr = cashu.Error{Detail: "all public keys must be the same for SIG_ALL", Code: NUT11ErrCode}
 	SigAllOnlySwap           = cashu.Error{Detail: "SIG_ALL can only be used in /swap operation", Code: NUT11ErrCode}
 	NSigsMustBeEqualErr      = cashu.Error{Detail: "all n_sigs must be the same for SIG_ALL", Code: NUT11ErrCode}
+
+	SigAllInputsNotUniformErr = cashu.Error{Detail: "all SIG_ALL inputs must share the same secret data and tags", Code: NUT11ErrCode}
+	DuplicatePubkeysErr       = cashu.Error{Detail: "duplicate public key in spending pathway", Code: NUT11ErrCode}
 )
 
 // NUT #11: Signatures are stored in `P2PKWitness` objects and are provided in either each `Proof.witness` of all inputs separately (for `SIG_INPUTS`) or only in the first input of the transaction (for `SIG_ALL`).
@@ -136,7 +140,12 @@ func ParseP2PKTags(tags [][]string) (*P2PKTags, error) {
 				errmsg := fmt.Sprintf("invalig n_sigs value: %v", err)
 				return nil, cashu.BuildCashuError(errmsg, NUT11ErrCode)
 			}
-			if nsig < 0 {
+			// NUT-11: "If n_sigs ... is not a positive integer ... the
+			// P2PK secret is malformed and the Proof MUST be rejected as
+			// unspendable." n_sigs=0 was previously accepted and treated
+			// as absent, silently weakening malformed locks to 1-of-n
+			// (tollgate #809).
+			if nsig < 1 {
 				return nil, NSigsMustBePositiveErr
 			}
 			p2pkTags.NSigs = int(nsig)
@@ -179,7 +188,8 @@ func ParseP2PKTags(tags [][]string) (*P2PKTags, error) {
 				errmsg := fmt.Sprintf("invalid n_sigs_refund value: %v", err)
 				return nil, cashu.BuildCashuError(errmsg, NUT11ErrCode)
 			}
-			if nsigr < 0 {
+			// NUT-11: n_sigs_refund must be a positive integer when present.
+			if nsigr < 1 {
 				return nil, NSigsMustBePositiveErr
 			}
 			p2pkTags.NSigsRefund = int(nsigr)
@@ -444,4 +454,183 @@ func VerifyP2PKLockedProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret)
 	}
 
 	return nil
+}
+
+// SigAllMessage builds the NUT-11 SIG_ALL aggregated message: the `secret`
+// and `C` of all inputs, then the `amount` (UTF-encoded decimal) and `B_`
+// of all outputs, in transaction order; for melts the `quote_id` is
+// appended. C and B_ are hex STRINGS and are concatenated as text
+// (NUT-11 "Message aggregation for SIG_ALL").
+func SigAllMessage(inputs cashu.Proofs, outputs cashu.BlindedMessages, quoteId string) []byte {
+	var msg strings.Builder
+	for _, proof := range inputs {
+		msg.WriteString(proof.Secret)
+		msg.WriteString(proof.C)
+	}
+	for _, output := range outputs {
+		msg.WriteString(strconv.FormatUint(output.Amount, 10))
+		msg.WriteString(output.B_)
+	}
+	if quoteId != "" {
+		msg.WriteString(quoteId)
+	}
+	return []byte(msg.String())
+}
+
+// HasDuplicateKeys reports whether any public key appears more than once
+// in one multisig pathway. NUT-11 compares keys by the lowercase hex
+// x-coordinate of the compressed serialization.
+func HasDuplicateKeys(keys []*btcec.PublicKey) bool {
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		x := hex.EncodeToString(key.SerializeCompressed()[1:33])
+		if seen[x] {
+			return true
+		}
+		seen[x] = true
+	}
+	return false
+}
+
+// VerifySigAllProofs verifies a spec-conformant SIG_ALL transaction: the
+// witness lives ONLY in the first input's Proof.witness and its signatures
+// are Schnorr signatures over sha256(SigAllMessage(inputs, outputs, quoteId))
+// (tollgate #809: gonuts previously demanded per-output witnesses over
+// sha256(B_) — a construction no other implementation produces or accepts).
+//
+// Semantics mirror VerifyP2PKLockedProof: locktime expiry ADDS the refund
+// pathway (it never revokes the primary one); with no refund keys an
+// expired lock is anyone-can-spend; the signable set for the primary path
+// is the data key UNION the pubkeys tag; duplicate keys per pathway are
+// malformed and rejected.
+func VerifySigAllProofs(inputs cashu.Proofs, outputs cashu.BlindedMessages, quoteId string) error {
+	if len(inputs) == 0 {
+		return cashu.NoProofsProvided
+	}
+
+	firstSecret, err := nut10.DeserializeSecret(inputs[0].Secret)
+	if err != nil {
+		return err
+	}
+	if firstSecret.Kind != nut10.P2PK {
+		errmsg := "SIG_ALL witness verification supports P2PK conditions (HTLC SIG_ALL is not implemented)"
+		return cashu.BuildCashuError(errmsg, NUT11ErrCode)
+	}
+
+	// NUT-11: if one input is SIG_ALL, all inputs MUST share the same
+	// Secret.data and Secret.tags (tag equality included — comparing only
+	// keys + n_sigs lets locktime/refund drift between inputs).
+	for _, proof := range inputs {
+		secret, err := nut10.DeserializeSecret(proof.Secret)
+		if err != nil {
+			return err
+		}
+		if !IsSigAll(secret) {
+			return AllSigAllFlagsErr
+		}
+		if secret.Data.Data != firstSecret.Data.Data || !reflect.DeepEqual(secret.Data.Tags, firstSecret.Data.Tags) {
+			return SigAllInputsNotUniformErr
+		}
+	}
+
+	p2pkTags, err := ParseP2PKTags(firstSecret.Data.Tags)
+	if err != nil {
+		return err
+	}
+
+	var witness P2PKWitness
+	if inputs[0].Witness != "" {
+		if err := json.Unmarshal([]byte(inputs[0].Witness), &witness); err != nil {
+			return InvalidWitness
+		}
+	}
+
+	msgHash := sha256.Sum256(SigAllMessage(inputs, outputs, quoteId))
+
+	// Locktime semantics: expiry is additive (cashu-audit #59 — the
+	// reference field accepts refund AND primary after expiry).
+	if p2pkTags.Locktime > 0 && time.Now().Unix() > p2pkTags.Locktime {
+		if len(p2pkTags.Refund) == 0 {
+			// no refund keys: unlocked after expiry, spendable by anyone
+			return nil
+		}
+		if HasDuplicateKeys(p2pkTags.Refund) {
+			return DuplicatePubkeysErr
+		}
+		if len(witness.Signatures) >= 1 && !DuplicateSignatures(witness.Signatures) {
+			refundRequired := 1
+			if p2pkTags.NSigsRefund > 0 {
+				refundRequired = p2pkTags.NSigsRefund
+			}
+			if HasValidSignatures(msgHash[:], witness.Signatures, refundRequired, p2pkTags.Refund) {
+				return nil
+			}
+		}
+		// refund path did not verify — fall through to the primary path
+	}
+
+	pubkey, err := ParsePublicKey(firstSecret.Data.Data)
+	if err != nil {
+		return err
+	}
+	// The primary pathway is the data key UNION the pubkeys tag (always —
+	// the dup-check covers the full set even when n_sigs is absent).
+	keys := []*btcec.PublicKey{pubkey}
+	keys = append(keys, p2pkTags.Pubkeys...)
+	if HasDuplicateKeys(keys) {
+		return DuplicatePubkeysErr
+	}
+	signaturesRequired := 1
+	if p2pkTags.NSigs > 0 {
+		signaturesRequired = p2pkTags.NSigs
+	}
+	if signaturesRequired > len(keys) {
+		return NotEnoughSignaturesErr
+	}
+	if len(witness.Signatures) < 1 {
+		return InvalidWitness
+	}
+	if DuplicateSignatures(witness.Signatures) {
+		return DuplicateSignaturesErr
+	}
+	if !HasValidSignatures(msgHash[:], witness.Signatures, signaturesRequired, keys) {
+		return NotEnoughSignaturesErr
+	}
+
+	return nil
+}
+
+// AddSigAllSignatureToFirstInput produces the spec-conformant SIG_ALL
+// witness for a spend: all signing keys sign sha256(SigAllMessage(...))
+// and the signatures are placed ONLY in the first input's witness
+// (tollgate #809: gonuts previously signed per-output sha256(B_)).
+func AddSigAllSignatureToFirstInput(
+	inputs cashu.Proofs,
+	outputs cashu.BlindedMessages,
+	quoteId string,
+	signingKeys ...*btcec.PrivateKey,
+) (cashu.Proofs, error) {
+	if len(inputs) == 0 {
+		return nil, cashu.NoProofsProvided
+	}
+	msgHash := sha256.Sum256(SigAllMessage(inputs, outputs, quoteId))
+
+	signatures := make([]string, 0, len(signingKeys))
+	for _, key := range signingKeys {
+		signature, err := schnorr.Sign(key, msgHash[:])
+		if err != nil {
+			return nil, err
+		}
+		signatures = append(signatures, hex.EncodeToString(signature.Serialize()))
+	}
+
+	witness, err := json.Marshal(P2PKWitness{Signatures: signatures})
+	if err != nil {
+		return nil, err
+	}
+	inputs[0].Witness = string(witness)
+	for i := 1; i < len(inputs); i++ {
+		inputs[i].Witness = ""
+	}
+	return inputs, nil
 }
