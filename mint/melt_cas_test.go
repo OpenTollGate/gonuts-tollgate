@@ -2,6 +2,8 @@ package mint_test
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"sync"
@@ -12,6 +14,7 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut10"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut11"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut14"
 	"github.com/OpenTollGate/gonuts-tollgate/mint"
 	"github.com/OpenTollGate/gonuts-tollgate/mint/lightning"
 	"github.com/OpenTollGate/gonuts-tollgate/mint/storage"
@@ -379,4 +382,115 @@ func TestMintQuoteSequentialDoubleMint(t *testing.T) {
 	if _, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: quote.Id, Outputs: outs2}); err == nil {
 		t.Fatal("sequential double mint must be rejected")
 	}
+}
+
+// htlcSigAllLockedProofs mints proofs locked to an HTLC SIG_ALL condition.
+func htlcSigAllLockedProofs(t *testing.T, m *mint.Mint, amount uint64, hashHex string) cashu.Proofs {
+	t.Helper()
+	condition := nut10.SpendingCondition{
+		Kind: nut10.HTLC,
+		Data: hashHex,
+		Tags: [][]string{{"sigflag", "SIG_ALL"}},
+	}
+	quote, err := m.RequestMintQuote(nut04.PostMintQuoteBolt11Request{Amount: amount, Unit: cashu.Sat.String()})
+	if err != nil {
+		t.Fatalf("error requesting mint quote: %v", err)
+	}
+	keyset := m.GetActiveKeyset()
+	blindedMessages, secrets, rs, err := testutils.BlindedMessagesFromSpendingCondition(
+		cashu.AmountSplit(amount), keyset.Id, condition)
+	if err != nil {
+		t.Fatalf("error creating locked blinded messages: %v", err)
+	}
+	signatures, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: quote.Id, Outputs: blindedMessages})
+	if err != nil {
+		t.Fatalf("error minting locked tokens: %v", err)
+	}
+	proofs, err := testutils.ConstructProofs(signatures, secrets, rs, keyset)
+	if err != nil {
+		t.Fatalf("error constructing proofs: %v", err)
+	}
+	return proofs
+}
+
+// TestSigAllHTLCSpecConstructionMeltAndSwap: spec-conformant HTLC SIG_ALL
+// spends (first-input witness: preimage + aggregate signature) must be
+// accepted by BOTH the melt and swap paths — the HTLC arm of the tollgate
+// #809 alignment (previously not-implemented).
+func TestSigAllHTLCSpecConstructionMeltAndSwap(t *testing.T) {
+	m, backend := newRaceTestMint(t)
+	const amount uint64 = 1000
+
+	preimage := make([]byte, 32)
+	rand.Read(preimage)
+	preimageHex := hex.EncodeToString(preimage)
+	hashHex := sha256Hex(t, preimage)
+
+	// --- melt ---
+	quote := raceTestMeltQuote(t, m, backend, amount)
+	proofs := htlcSigAllLockedProofs(t, m, amount, hashHex)
+	outputs := blankOutputs(t, m, 4)
+
+	signed, err := nut14.AddSigAllHTLCToFirstInput(proofs, outputs, quote.Id, preimageHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+		Quote:   quote.Id,
+		Inputs:  signed,
+		Outputs: outputs,
+	}); err != nil {
+		t.Fatalf("spec-conformant HTLC SIG_ALL melt must succeed: %v", err)
+	}
+	finalQuote, err := m.GetMeltQuoteState(context.Background(), quote.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalQuote.State != nut05.Paid {
+		t.Fatalf("HTLC SIG_ALL melt quote must end Paid, got %v", finalQuote.State)
+	}
+
+	// wrong preimage rejected, quote stays retryable
+	quote2 := raceTestMeltQuote(t, m, backend, amount)
+	proofs2 := htlcSigAllLockedProofs(t, m, amount, hashHex)
+	wrongPreimage := make([]byte, 32)
+	rand.Read(wrongPreimage)
+	badSigned, err := nut14.AddSigAllHTLCToFirstInput(proofs2, outputs, quote2.Id, hex.EncodeToString(wrongPreimage))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+		Quote:   quote2.Id,
+		Inputs:  badSigned,
+		Outputs: outputs,
+	}); err == nil {
+		t.Fatal("HTLC SIG_ALL melt with wrong preimage must be rejected")
+	}
+	finalQuote2, err := m.GetMeltQuoteState(context.Background(), quote2.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalQuote2.State != nut05.Unpaid {
+		t.Fatalf("rejected melt must leave the quote Unpaid (retryable), got %v", finalQuote2.State)
+	}
+
+	// --- swap ---
+	proofs3 := htlcSigAllLockedProofs(t, m, amount, hashHex)
+	swapOutputs, _, _, err := testutils.CreateBlindedMessages(amount, m.GetActiveKeyset().Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapSigned, err := nut14.AddSigAllHTLCToFirstInput(proofs3, swapOutputs, "", preimageHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Swap(swapSigned, swapOutputs); err != nil {
+		t.Fatalf("spec-conformant HTLC SIG_ALL swap must succeed: %v", err)
+	}
+}
+
+func sha256Hex(t *testing.T, b []byte) string {
+	t.Helper()
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
