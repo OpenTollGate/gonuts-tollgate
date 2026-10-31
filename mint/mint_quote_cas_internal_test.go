@@ -76,13 +76,15 @@ func TestMintQuoteConcurrentDoubleIssuance(t *testing.T) {
 		}
 
 		errs := make([]error, 2)
+		sigs := make([]cashu.BlindedSignatures, 2)
 		var wg sync.WaitGroup
 		for i, outs := range []cashu.BlindedMessages{outsA, outsB} {
 			wg.Add(1)
 			go func(i int, outs cashu.BlindedMessages) {
 				defer wg.Done()
-				_, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: quote.Id, Outputs: outs})
+				s, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: quote.Id, Outputs: outs})
 				errs[i] = err
+				sigs[i] = s
 			}(i, outs)
 		}
 		wg.Wait()
@@ -95,8 +97,9 @@ func TestMintQuoteConcurrentDoubleIssuance(t *testing.T) {
 			}
 		}
 		if winners != 1 {
-			t.Fatalf("round %d: exactly one mint must issue, got %d (errs: %v / %v)",
-				round, winners, errs[0], errs[1])
+			q, _ := m.GetMintQuoteState(quote.Id)
+			t.Fatalf("round %d: exactly one mint must issue, got %d (errs: %v / %v; sigs: %d / %d; finalState: %v)",
+				round, winners, errs[0], errs[1], len(sigs[0]), len(sigs[1]), q.State)
 		}
 
 		finalQuote, err := m.GetMintQuoteState(quote.Id)

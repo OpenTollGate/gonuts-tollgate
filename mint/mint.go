@@ -346,15 +346,26 @@ func (m *Mint) GetMintQuoteState(quoteId string) (storage.MintQuote, error) {
 
 		if status.Settled {
 			m.logInfof("mint quote '%v' with invoice payment hash '%v' was paid", mintQuote.Id, mintQuote.PaymentHash)
-			mintQuote.State = nut04.Paid
-			err := m.db.UpdateMintQuoteState(mintQuote.Id, mintQuote.State)
+			// Unpaid->Paid ONLY (conditional): the read above is advisory;
+			// between it and this write a concurrent minter may have
+			// claimed the quote (Pending) — an unconditional write would
+			// resurrect Paid and open a second claim (double issuance).
+			claimed, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Unpaid, nut04.Paid)
 			if err != nil {
 				errmsg := fmt.Sprintf("error updating mint quote in db: %v", err)
 				return storage.MintQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
-
-			jsonQuote, _ := json.Marshal(mintQuote)
-			m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
+			if !claimed {
+				// someone advanced the quote past UNPAID — return their truth
+				fresh, err := m.db.GetMintQuote(mintQuote.Id)
+				if err == nil {
+					mintQuote = fresh
+				}
+			} else {
+				mintQuote.State = nut04.Paid
+				jsonQuote, _ := json.Marshal(mintQuote)
+				m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
+			}
 		}
 	}
 
@@ -464,11 +475,18 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 				return err
 			}
 
-			// mark quote as issued after signing the blinded messages
+			// mark quote as issued after signing the blinded messages —
+			// Pending->Issued conditionally: only the claim-holder reaches
+			// here, so a loss means unexpected concurrent state surgery.
 			mintQuote.State = nut04.Issued
-			if err := m.db.UpdateMintQuoteState(mintQuote.Id, nut04.Issued); err != nil {
+			issued, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Pending, nut04.Issued)
+			if err != nil {
 				errmsg := fmt.Sprintf("error updating mint quote state: %v", err)
 				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+			}
+			if !issued {
+				m.logErrorf("mint quote '%v' left PENDING before its claim-holder could mark it ISSUED — concurrent writer detected", mintQuote.Id)
+				return cashu.BuildCashuError("mint quote state changed underneath issuance", cashu.DBErrCode)
 			}
 			if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
 				errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
@@ -1032,12 +1050,12 @@ func (m *Mint) settleQuotesInternally(
 		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 
-	// mark mint quote request as paid
+	// mark mint quote request as paid — Unpaid->Paid ONLY (conditional):
+	// a concurrent minter may have claimed it already; never resurrect
+	// Paid over Pending/Issued (double-issuance guard, cashu-audit #59).
 	mintQuote.State = nut04.Paid
-	err = m.db.UpdateMintQuoteState(mintQuote.Id, mintQuote.State)
-	if err != nil {
-		errmsg := fmt.Sprintf("error updating mint quote state: %v", err)
-		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	if _, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Unpaid, nut04.Paid); err != nil {
+		m.logErrorf("could not mark mint quote '%v' PAID during internal settle: %v", mintQuote.Id, err)
 	}
 	jsonQuote, _ := json.Marshal(mintQuote)
 	m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
