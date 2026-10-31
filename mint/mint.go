@@ -363,6 +363,12 @@ func (m *Mint) GetMintQuoteState(quoteId string) (storage.MintQuote, error) {
 
 // MintTokens verifies whether the mint quote with id has been paid and proceeds to
 // sign the blindedMessages and return the BlindedSignatures if it was paid.
+	// mintQuoteClaimBarrier is a test seam (the postMeltBolt11 pattern):
+// invoked between the quote read and the Paid->Pending CAS claim in
+// MintTokens, so tests can deterministically stage both callers past the
+// read before either claims — the double-issuance race window.
+var mintQuoteClaimBarrier = func() {}
+
 func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.BlindedSignatures, error) {
 	// NUT #04: The total output amount **MUST NOT** exceed the quote's currently mintable amount, `amount_paid - amount_issued`.
 	mintQuote, err := m.GetMintQuoteState(mintTokensRequest.Quote)
@@ -381,11 +387,20 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 		return nil, cashu.QuotePending
 	case nut04.Paid:
 		err := func() error {
-			// set quote as pending while validating blinded messages and signing
-			err = m.db.UpdateMintQuoteState(mintQuote.Id, nut04.Pending)
+			// Atomically claim the quote Paid->Pending before any signing
+			// work. The read-check above is advisory; THIS is the guard:
+			// two concurrent MintTokens on one paid quote (with disjoint
+			// outputs) both passed it, both unconditionally wrote Pending,
+			// and both signed — double issuance for one payment (the
+			// mint-side sibling of the melt-quote TOCTOU, cashu-audit #59).
+			mintQuoteClaimBarrier()
+			claimed, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Paid, nut04.Pending)
 			if err != nil {
-				errmsg := fmt.Sprintf("error mint quote state: %v", err)
+				errmsg := fmt.Sprintf("error claiming mint quote state: %v", err)
 				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+			}
+			if !claimed {
+				return cashu.QuotePending
 			}
 
 			blindedMessages := mintTokensRequest.Outputs
@@ -465,10 +480,18 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 			return nil
 		}()
 
-		// update mint quote to previous state if there was an error
+		// release the claim on error so a corrected retry stays possible.
+		// The rollback is itself conditional (Pending->Paid): we only ever
+		// write back the state WE hold. A rollback failure means the row
+		// moved underneath us — log loudly, it needs operator eyes (same
+		// posture as the melt-path rollback).
 		if err != nil {
-			if err := m.db.UpdateMintQuoteState(mintQuote.Id, mintQuote.State); err != nil {
-				return nil, err
+			if err != cashu.QuotePending {
+				released, rbErr := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Pending, nut04.Paid)
+				if rbErr != nil || !released {
+					m.logErrorf("mint quote '%v' rollback after failure did not release the claim (released=%v, err=%v) — quote may rest PENDING: %v",
+						mintQuote.Id, released, rbErr, err)
+				}
 			}
 			return nil, err
 		}

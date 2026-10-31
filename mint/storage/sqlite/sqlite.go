@@ -577,6 +577,26 @@ func (sqlite *SQLiteDB) UpdateMintQuoteState(quoteId string, state nut04.State) 
 	return nil
 }
 
+// UpdateMintQuoteStateCAS atomically claims a mint-quote state transition:
+// the UPDATE's WHERE carries the expected prior state, so exactly one
+// concurrent caller flips the row. Guards MintTokens against concurrent
+// double issuance on one paid quote (the mint-side sibling of the melt
+// quote CAS — cashu-audit #59).
+func (sqlite *SQLiteDB) UpdateMintQuoteStateCAS(quoteId string, from nut04.State, to nut04.State) (bool, error) {
+	result, err := sqlite.db.Exec(
+		"UPDATE mint_quotes SET state = ? WHERE id = ? AND state = ?",
+		to.String(), quoteId, from.String(),
+	)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return count == 1, nil
+}
+
 func (sqlite *SQLiteDB) SaveMeltQuote(meltQuote storage.MeltQuote) error {
 	_, err := sqlite.db.Exec(`
 		INSERT INTO melt_quotes 

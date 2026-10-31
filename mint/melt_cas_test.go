@@ -350,3 +350,33 @@ func TestSigAllSpecConstructionMeltAndSwap(t *testing.T) {
 		t.Fatalf("spec-conformant SIG_ALL swap must succeed: %v", err)
 	}
 }
+
+// TestMintQuoteSequentialDoubleMint: after issuance, a second mint on the
+// same quote is rejected.
+func TestMintQuoteSequentialDoubleMint(t *testing.T) {
+	m, _ := newRaceTestMint(t)
+	const amount uint64 = 1000
+
+	quote, err := m.RequestMintQuote(nut04.PostMintQuoteBolt11Request{
+		Amount: amount,
+		Unit:   cashu.Sat.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyset := m.GetActiveKeyset()
+	outs, _, _, err := testutils.CreateBlindedMessages(amount, keyset.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: quote.Id, Outputs: outs}); err != nil {
+		t.Fatalf("first mint must succeed: %v", err)
+	}
+	outs2, _, _, err := testutils.CreateBlindedMessages(amount, keyset.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: quote.Id, Outputs: outs2}); err == nil {
+		t.Fatal("sequential double mint must be rejected")
+	}
+}
