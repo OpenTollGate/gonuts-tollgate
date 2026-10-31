@@ -814,17 +814,41 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 		return storage.MeltQuote{}, nut11.SigAllOnlySwap
 	}
 
-	m.logInfof("verified proofs in melt tokens request. Setting proofs as pending before attempting payment.")
-	// set proofs as pending before trying to make payment
+	m.logInfof("verified proofs in melt tokens request. Claiming quote via CAS before attempting payment.")
+	// Atomically claim the quote UNPAID->PENDING before any payment work.
+	// The read-check above is advisory (friendly errors); THIS is the guard:
+	// two concurrent melts on one quote (even with disjoint proof sets) both
+	// passed it, both unconditionally wrote Pending, and both paid — the
+	// double-settlement TOCTOU (cashu-audit #59 P0). Exactly one CAS wins.
+	claimed, err := m.db.UpdateMeltQuoteStateCAS(meltQuote.Id, nut05.Unpaid, nut05.Pending)
+	if err != nil {
+		errmsg := fmt.Sprintf("error claiming melt quote state: %v", err)
+		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	}
+	if !claimed {
+		return storage.MeltQuote{}, cashu.QuotePending
+	}
+	meltQuote.State = nut05.Pending
+
+	// set proofs as pending before trying to make payment (the per-Y guard:
+	// this is what correctly rejects same-proofs races across quotes)
 	err = m.db.AddPendingProofs(proofs, meltQuote.Id)
 	if err != nil {
 		errmsg := fmt.Sprintf("error setting proofs as pending in db: %v", err)
-		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
-	}
-	meltQuote.State = nut05.Pending
-	err = m.db.UpdateMeltQuote(meltQuote.Id, "", nut05.Pending)
-	if err != nil {
-		errmsg := fmt.Sprintf("error updating melt quote state: %v", err)
+		// Release the claimed quote (Pending->Unpaid) so a retry with
+		// different proofs stays possible. Without this, a same-proofs
+		// race across two quotes strands the losing quote in PENDING
+		// with no payment behind it (fund-safety: failure paths must
+		// restore retryability; AddPendingProofs is a single tx, so
+		// nothing was written when it fails).
+		if _, rbErr := m.db.UpdateMeltQuoteStateCAS(meltQuote.Id, nut05.Pending, nut05.Unpaid); rbErr != nil {
+			errmsg = fmt.Sprintf(
+				"%v (rollback failed: %v — quote '%v' remains PENDING, needs pending-quote recovery)",
+				errmsg, rbErr, meltQuote.Id,
+			)
+			m.logErrorf("melt quote '%v' stranded PENDING after AddPendingProofs failure: %v (rollback error: %v)",
+				meltQuote.Id, err, rbErr)
+		}
 		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 
