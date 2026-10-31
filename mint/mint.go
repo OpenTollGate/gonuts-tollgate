@@ -835,6 +835,20 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 	err = m.db.AddPendingProofs(proofs, meltQuote.Id)
 	if err != nil {
 		errmsg := fmt.Sprintf("error setting proofs as pending in db: %v", err)
+		// Release the claimed quote (Pending->Unpaid) so a retry with
+		// different proofs stays possible. Without this, a same-proofs
+		// race across two quotes strands the losing quote in PENDING
+		// with no payment behind it (fund-safety: failure paths must
+		// restore retryability; AddPendingProofs is a single tx, so
+		// nothing was written when it fails).
+		if _, rbErr := m.db.UpdateMeltQuoteStateCAS(meltQuote.Id, nut05.Pending, nut05.Unpaid); rbErr != nil {
+			errmsg = fmt.Sprintf(
+				"%v (rollback failed: %v — quote '%v' remains PENDING, needs pending-quote recovery)",
+				errmsg, rbErr, meltQuote.Id,
+			)
+			m.logErrorf("melt quote '%v' stranded PENDING after AddPendingProofs failure: %v (rollback error: %v)",
+				meltQuote.Id, err, rbErr)
+		}
 		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 
