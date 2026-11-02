@@ -2,6 +2,7 @@ package mint
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
@@ -544,5 +545,115 @@ func TestMintTokensCrashRecovery(t *testing.T) {
 	}
 	if _, err := m.MintTokens(nut04.PostMintBolt11Request{Quote: q4.Id, Outputs: outs4}); err == nil {
 		t.Fatal("issued quote with no stored signatures must NOT mint (the stranded shape needs operator recovery)")
+	}
+}
+
+// TestMeltQuotePollReconciliation stages the melt saga's crash windows by
+// db state (in-process kill/restart equivalence) and drives recovery via
+// the poll path (GetMeltQuoteState) — cashu-audit #59 crash-consistency:
+//
+//	crash after claim, before payment attempt -> orphan PENDING, no outgoing payment
+//	crash after payment, before settle        -> backend SUCCEEDED, quote PENDING
+//	in-flight melt                            -> poll must NOT reconcile underneath
+func TestMeltQuotePollReconciliation(t *testing.T) {
+	fakeBackend := &lightning.FakeBackend{}
+	m, err := LoadMint(Config{
+		MintPath:        t.TempDir(),
+		LightningClient: fakeBackend,
+		LogLevel:        Disable,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	// registerInvoice: FakeBackend's CreateInvoice registers a born-settled
+	// entry that OutgoingPaymentStatus then finds as SUCCEEDED — the
+	// "auto-pay" quirk. For the never-paid window the invoice must NOT be
+	// registered (CreateFakeInvoice builds it unregistered).
+	stagedQuote := func(amount uint64, registerInvoice bool) (storage.MeltQuote, cashu.Proofs) {
+		var request string
+		if registerInvoice {
+			invoice, err := fakeBackend.CreateInvoice(amount)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request = invoice.PaymentRequest
+		} else {
+			req, _, _, err := lightning.CreateFakeInvoice(amount, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request = req
+		}
+		quote, err := m.RequestMeltQuote(nut05.PostMeltQuoteBolt11Request{
+			Request: request,
+			Unit:    cashu.Sat.String(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		proofs := internalTestProofs(t, m, int(amount/8))
+		if _, err := m.db.UpdateMeltQuoteStateCAS(quote.Id, nut05.Unpaid, nut05.Pending); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.db.AddPendingProofs(proofs, quote.Id); err != nil {
+			t.Fatal(err)
+		}
+		return quote, proofs
+	}
+
+	// (A) orphan claim, no payment attempt: poll releases to UNPAID
+	qA, proofsA := stagedQuote(8, false)
+	polled, err := m.GetMeltQuoteState(ctx, qA.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polled.State != nut05.Unpaid {
+		t.Fatalf("orphaned claim must reconcile to UNPAID, got %v", polled.State)
+	}
+	// the proofs must be released: a fresh melt with them must be accepted
+	// (verifyProofs passes only when they are neither pending nor used)
+	yHexes := make([]string, len(proofsA))
+	for i, p := range proofsA {
+		Y, err := crypto.HashToCurve([]byte(p.Secret))
+		if err != nil {
+			t.Fatal(err)
+		}
+		yHexes[i] = hex.EncodeToString(Y.SerializeCompressed())
+	}
+	if err := m.verifyProofs(proofsA, yHexes); err != nil {
+		t.Fatalf("released proofs must be spendable again, got: %v", err)
+	}
+
+	// (B) payment made, settle lost: poll completes PAID + atomic settle + preimage
+	qB, _ := stagedQuote(8, true)
+	if _, err := fakeBackend.SendPayment(ctx, qB.InvoiceRequest, 0); err != nil {
+		t.Fatal(err)
+	}
+	polledB, err := m.GetMeltQuoteState(ctx, qB.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polledB.State != nut05.Paid {
+		t.Fatalf("paid-but-unsettled quote must reconcile to PAID, got %v", polledB.State)
+	}
+	if polledB.Preimage != lightning.FakePreimage {
+		t.Fatalf("reconciled quote must carry the backend preimage, got %q", polledB.Preimage)
+	}
+
+	// (C) in-flight melt: poll must NOT reconcile underneath it
+	qC, _ := stagedQuote(8, true)
+	if _, err := fakeBackend.SendPayment(ctx, qC.InvoiceRequest, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.meltInFlight.Store(qC.Id, struct{}{})
+	defer m.meltInFlight.Delete(qC.Id)
+	polledC, err := m.GetMeltQuoteState(ctx, qC.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if polledC.State != nut05.Pending {
+		t.Fatalf("in-flight quote must be left PENDING by the poll, got %v", polledC.State)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
@@ -56,6 +57,13 @@ type Mint struct {
 
 	// map of all keysets (both active and inactive)
 	keysets map[string]crypto.MintKeyset
+
+	// meltInFlight marks melt quotes whose MeltTokens call is currently
+	// between claim and settle — the poll-path reconciler must not touch
+	// them (a concurrent poll settling underneath an active melt produces
+	// double-settle noise). After a crash nothing is in flight, so every
+	// orphan reconciles on its first poll.
+	meltInFlight sync.Map
 
 	lightningClient lightning.Client
 	mintInfo        nut06.MintInfo
@@ -993,33 +1001,62 @@ func (m *Mint) GetMeltQuoteState(ctx context.Context, quoteId string) (storage.M
 		return storage.MeltQuote{}, cashu.QuoteNotExistErr
 	}
 
-	// if quote is pending, check with backend if status of payment has changed
+	// if quote is pending, check with backend if status of payment has changed.
+	// NEVER for a quote whose MeltTokens call is in flight — reconciling
+	// underneath an active melt double-settles (the marker clears when the
+	// call returns, so crash orphans reconcile on their first poll).
 	if meltQuote.State == nut05.Pending {
+		if _, inFlight := m.meltInFlight.Load(meltQuote.Id); inFlight {
+			return meltQuote, nil
+		}
 		m.logDebugf("checking status of payment with hash '%v' for melt quote '%v'",
 			meltQuote.PaymentHash, meltQuote.Id)
 
 		paymentStatus, err := m.lightningClient.OutgoingPaymentStatus(ctx, meltQuote.PaymentHash)
 		if err != nil {
+			// A not-found outgoing payment is definitive: nothing was ever
+			// paid (crash between the quote claim and the payment attempt —
+			// the orphan that previously rested PENDING forever). Same
+			// verdict as MeltTokens' own failure path: release the claim
+			// and the pending proofs so the quote stays retryable.
+			if errors.Is(err, lightning.OutgoingPaymentNotFound) || status.Code(err) == codes.NotFound {
+				m.logInfof("no outgoing payment found for hash %v. Releasing orphaned claim on melt quote '%v' back to UNPAID",
+					meltQuote.PaymentHash, meltQuote.Id)
+				released, rbErr := m.db.UpdateMeltQuoteStateCAS(meltQuote.Id, nut05.Pending, nut05.Unpaid)
+				if rbErr != nil {
+					errmsg := fmt.Sprintf("error releasing orphaned melt quote: %v", rbErr)
+					return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+				}
+				if released {
+					if _, err := m.removePendingProofsForQuote(meltQuote.Id); err != nil {
+						errmsg := fmt.Sprintf("error removing pending proofs for quote: %v", err)
+						return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+					}
+					meltQuote.State = nut05.Unpaid
+				}
+				return meltQuote, nil
+			}
 			m.logErrorf(`error checking outgoing payment status: %v. Leaving proofs for quote '%v' as pending`,
 				err, meltQuote.Id)
 			return meltQuote, nil
 		}
 
 		switch paymentStatus.PaymentStatus {
-		// settle proofs (remove pending, and add to used)
-		// mark quote as paid and set preimage
+		// settle proofs (remove pending, and add to used — ONE transaction:
+		// the two-statement form left the same re-claim window the melt path
+		// fixed) and mark quote as paid with preimage
 		case lightning.Succeeded:
 			m.logInfof("payment %v succeded. setting melt quote '%v' to paid and invalidating proofs",
 				meltQuote.PaymentHash, meltQuote.Id)
 
-			proofs, err := m.removePendingProofsForQuote(meltQuote.Id)
+			proofs, Ys, err := m.pendingProofsForQuote(meltQuote.Id)
 			if err != nil {
-				errmsg := fmt.Sprintf("error removing pending proofs for quote: %v", err)
+				errmsg := fmt.Sprintf("error loading pending proofs for quote: %v", err)
 				return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
-			err = m.db.SaveProofs(proofs)
+			err = m.db.SettleProofs(Ys, proofs)
 			if err != nil {
-				errmsg := fmt.Sprintf("error invalidating proofs. Could not save proofs to db: %v", err)
+				errmsg := fmt.Sprintf("error settling proofs for quote (pending->used must be atomic): %v", err)
 				return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
 
@@ -1080,6 +1117,29 @@ func (m *Mint) removePendingProofsForQuote(quoteId string) (cashu.Proofs, error)
 	}
 
 	return proofs, nil
+}
+
+// pendingProofsForQuote loads a quote's pending proofs and Ys WITHOUT
+// removing them — for the atomic SettleProofs path (pending->used in one
+// transaction; the remove+save two-statement form left a re-claim window).
+func (m *Mint) pendingProofsForQuote(quoteId string) (cashu.Proofs, []string, error) {
+	dbproofs, err := m.db.GetPendingProofsByQuote(quoteId)
+	if err != nil {
+		return nil, nil, err
+	}
+	proofs := make(cashu.Proofs, len(dbproofs))
+	Ys := make([]string, len(dbproofs))
+	for i, dbproof := range dbproofs {
+		Ys[i] = dbproof.Y
+		proofs[i] = cashu.Proof{
+			Amount:  dbproof.Amount,
+			Id:      dbproof.Id,
+			Secret:  dbproof.Secret,
+			C:       dbproof.C,
+			Witness: dbproof.Witness,
+		}
+	}
+	return proofs, Ys, nil
 }
 
 // MeltTokens verifies whether proofs provided are valid
@@ -1149,6 +1209,9 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 	if !claimed {
 		return storage.MeltQuote{}, cashu.QuotePending
 	}
+	// mark in-flight for the poll-path reconciler; released on every exit
+	m.meltInFlight.Store(meltQuote.Id, struct{}{})
+	defer m.meltInFlight.Delete(meltQuote.Id)
 	meltQuote.State = nut05.Pending
 
 	// set proofs as pending before trying to make payment (the per-Y guard:
@@ -1915,7 +1978,7 @@ func (m *Mint) SetMintInfo(mintInfo MintInfo) {
 	m.mintInfo = info
 }
 
-func (m Mint) RetrieveMintInfo() (nut06.MintInfo, error) {
+func (m *Mint) RetrieveMintInfo() (nut06.MintInfo, error) {
 	seed, err := m.db.GetSeed()
 	if err != nil {
 		return nut06.MintInfo{}, err

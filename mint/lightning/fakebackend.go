@@ -144,7 +144,9 @@ func (fb *FakeBackend) OutgoingPaymentStatus(ctx context.Context, hash string) (
 		return i.PaymentHash == hash
 	})
 	if invoiceIdx == -1 {
-		return PaymentStatus{}, errors.New("payment does not exist")
+		// the sentinel (mirrors the CLN/LND clients) — callers distinguish
+		// "nothing was ever paid" from a transient status error
+		return PaymentStatus{}, OutgoingPaymentNotFound
 	}
 
 	return PaymentStatus{
