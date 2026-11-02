@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write, and Pending/Issued quotes with a fully signed output set replay
   the stored signatures (completing Pending→Issued) — a client can
   recover its signatures after any crash point.
+- Melt saga completion: the quote-state poll reconciles crash orphans —
+  a not-found outgoing payment (crash before the payment attempt)
+  releases the claim back to UNPAID with proofs re-spendable; a paid-
+  but-unsettled quote settles atomically with its preimage; polls never
+  reconcile underneath an in-flight melt.
 
 ### Added
 - NUT-29 batch endpoints: atomic batch mint across paid quotes
