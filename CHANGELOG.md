@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quote-state responses, zero-amount mint quotes rejected.
 
 ### Changed
+- Test infrastructure: a subprocess SIGKILL kill/restart harness exercises
+  the melt saga's crash boundaries against the real binary over HTTP
+  (`go test ./mint/ -tags killtest`); FakeBackend gained durable
+  outgoing-payment state and settlement self-healing for it.
 - Swap inputs are claimed (pending-proofs) before signing — the loser
   fails before signature computation; defense-in-depth on top of the
   settle-time uniqueness guard.
