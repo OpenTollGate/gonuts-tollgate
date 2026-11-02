@@ -5,8 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"time"
 
@@ -31,6 +33,9 @@ type FakeBackendInvoice struct {
 	Status         State
 	Amount         uint64
 	Expiry         uint64
+	// AttemptedAt: when SendPayment/PayPartialAmount appended this outgoing
+	// entry (settlement self-healing with PaymentDelay; zero = payee invoice).
+	AttemptedAt int64
 }
 
 func (i *FakeBackendInvoice) ToInvoice() Invoice {
@@ -47,6 +52,9 @@ func (i *FakeBackendInvoice) ToInvoice() Invoice {
 type FakeBackend struct {
 	Invoices     []FakeBackendInvoice
 	PaymentDelay int64
+	// statePath: when set (LoadState), outgoing entries persist across
+	// restarts — the kill/restart harness models a durable backend.
+	statePath string
 }
 
 func (fb *FakeBackend) ConnectionStatus() error { return nil }
@@ -81,6 +89,34 @@ func (fb *FakeBackend) InvoiceStatus(hash string) (Invoice, error) {
 	return fb.Invoices[invoiceIdx].ToInvoice(), nil
 }
 
+// LoadState restores outgoing-payment entries from a JSON file — models
+// the backend as an independent durable process across mint restarts
+// (the kill/restart harness's premise). Only attempted payments are
+// persisted; payee invoices are reconstructed on demand.
+func (fb *FakeBackend) LoadState(path string) error {
+	fb.statePath = path
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &fb.Invoices)
+}
+
+// SaveState persists the invoice list (called on every append).
+func (fb *FakeBackend) SaveState() error {
+	if fb.statePath == "" {
+		return nil
+	}
+	data, err := json.Marshal(fb.Invoices)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(fb.statePath, data, 0o644)
+}
+
 func (fb *FakeBackend) SendPayment(ctx context.Context, request string, maxFee uint64) (PaymentStatus, error) {
 	invoice, err := decodepay.Decodepay(request)
 	if err != nil {
@@ -96,13 +132,20 @@ func (fb *FakeBackend) SendPayment(ctx context.Context, request string, maxFee u
 		}
 	}
 
+	// the stored entry carries the attempt time so OutgoingPaymentStatus
+	// can self-heal: with PaymentDelay set, a payment first seen PENDING is
+	// reported SUCCEEDED once the delay elapses (mirrors a real backend
+	// where the payment completes after the caller lost interest — the
+	// kill/restart harness depends on this transition).
 	outgoingPayment := FakeBackendInvoice{
 		PaymentHash: invoice.PaymentHash,
 		Preimage:    FakePreimage,
 		Status:      status,
 		Amount:      uint64(invoice.MSatoshi) * 1000,
+		AttemptedAt: time.Now().Unix(),
 	}
 	fb.Invoices = append(fb.Invoices, outgoingPayment)
+	fb.SaveState() // best-effort durability across restarts
 
 	return PaymentStatus{
 		Preimage:      FakePreimage,
@@ -130,8 +173,10 @@ func (fb *FakeBackend) PayPartialAmount(ctx context.Context, request string, amo
 		Preimage:    FakePreimage,
 		Status:      status,
 		Amount:      uint64(invoice.MSatoshi) * 1000,
+		AttemptedAt: time.Now().Unix(),
 	}
 	fb.Invoices = append(fb.Invoices, outgoingPayment)
+	fb.SaveState() // best-effort durability across restarts
 
 	return PaymentStatus{
 		Preimage:      FakePreimage,
@@ -149,9 +194,16 @@ func (fb *FakeBackend) OutgoingPaymentStatus(ctx context.Context, hash string) (
 		return PaymentStatus{}, OutgoingPaymentNotFound
 	}
 
+	entry := fb.Invoices[invoiceIdx]
+	status := entry.Status
+	if status == Pending && fb.PaymentDelay > 0 && entry.AttemptedAt > 0 &&
+		time.Now().Unix() >= entry.AttemptedAt+fb.PaymentDelay {
+		// self-heal: the payment attempt settled after the delay
+		status = Succeeded
+	}
 	return PaymentStatus{
 		Preimage:      FakePreimage,
-		PaymentStatus: fb.Invoices[invoiceIdx].Status,
+		PaymentStatus: status,
 	}, nil
 }
 
