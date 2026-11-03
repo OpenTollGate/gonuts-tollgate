@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
@@ -56,6 +57,13 @@ type Mint struct {
 
 	// map of all keysets (both active and inactive)
 	keysets map[string]crypto.MintKeyset
+
+	// meltInFlight marks melt quotes whose MeltTokens call is currently
+	// between claim and settle — the poll-path reconciler must not touch
+	// them (a concurrent poll settling underneath an active melt produces
+	// double-settle noise). After a crash nothing is in flight, so every
+	// orphan reconciles on its first poll.
+	meltInFlight sync.Map
 
 	lightningClient lightning.Client
 	mintInfo        nut06.MintInfo
@@ -277,6 +285,12 @@ func (m *Mint) RequestMintQuote(mintQuoteRequest nut04.PostMintQuoteBolt11Reques
 
 	// check limits
 	requestAmount := mintQuoteRequest.Amount
+	// NUT-04: the amount MUST be a positive integer — a zero-amount quote
+	// is malformed (cashu-audit #59 P2 hygiene; previously a 0-sat
+	// invoice and an immediately-satisfiable quote were issued).
+	if requestAmount == 0 {
+		return storage.MintQuote{}, cashu.MintQuoteZeroAmountErr
+	}
 	if m.limits.MintingSettings.MaxAmount > 0 {
 		if requestAmount > m.limits.MintingSettings.MaxAmount {
 			return storage.MintQuote{}, cashu.MintAmountExceededErr
@@ -374,11 +388,198 @@ func (m *Mint) GetMintQuoteState(quoteId string) (storage.MintQuote, error) {
 
 // MintTokens verifies whether the mint quote with id has been paid and proceeds to
 // sign the blindedMessages and return the BlindedSignatures if it was paid.
-	// mintQuoteClaimBarrier is a test seam (the postMeltBolt11 pattern):
+// mintQuoteClaimBarrier is a test seam (the postMeltBolt11 pattern):
 // invoked between the quote read and the Paid->Pending CAS claim in
 // MintTokens, so tests can deterministically stage both callers past the
 // read before either claims — the double-issuance race window.
 var mintQuoteClaimBarrier = func() {}
+
+// Batch limits (NUT-29: implementations MAY impose maximum batch sizes).
+const (
+	BatchCheckLimit = 50
+	BatchMaxOutputs = 1000
+)
+
+// MintTokensBatch atomically mints a consolidated output set against
+// multiple PAID bolt11 quotes (NUT-29). All-or-nothing: every quote is
+// claimed (Paid->Pending CAS) before any signing; any failure rolls every
+// claim back (Pending->Paid, releasing only claims WE hold) so the batch
+// is retryable. NUT-20 locked quotes are signed per-quote over
+// quotes[i] + the FULL consolidated outputs (nuts/29.md).
+func (m *Mint) MintTokensBatch(quoteIds []string, outputs cashu.BlindedMessages, signatures []string) (cashu.BlindedSignatures, error) {
+	if len(quoteIds) == 0 {
+		return nil, cashu.NoProofsProvided
+	}
+	if len(outputs) > BatchMaxOutputs {
+		return nil, cashu.BuildCashuError(
+			fmt.Sprintf("too many outputs: max %d", BatchMaxOutputs), cashu.StandardErrCode)
+	}
+
+	// validation rule 2: unique quote ids
+	seen := make(map[string]bool, len(quoteIds))
+	for _, id := range quoteIds {
+		if seen[id] {
+			return nil, cashu.DuplicateQuotesErr
+		}
+		seen[id] = true
+	}
+
+	// fetch every quote up front (all-or-nothing: unknown id rejects the
+	// whole batch before anything is claimed)
+	quotes := make([]storage.MintQuote, len(quoteIds))
+	totalAmount := uint64(0)
+	for i, id := range quoteIds {
+		quote, err := m.GetMintQuoteState(id)
+		if err != nil {
+			return nil, err
+		}
+		if quote.State != nut04.Paid {
+			return nil, cashu.MintQuoteRequestNotPaid
+		}
+		quotes[i] = quote
+		totalAmount += quote.Amount
+	}
+
+	// outputs validation (rule 7, bolt11: sum(outputs) == sum(quotes))
+	outputsAmount, err := outputs.AmountChecked()
+	if err != nil {
+		return nil, cashu.InvalidBlindedMessageAmount
+	}
+	if cashu.CheckDuplicateBlindedMessages(outputs) {
+		return nil, cashu.DuplicateOutputs
+	}
+	if outputsAmount != totalAmount {
+		return nil, cashu.OutputsOverQuoteAmountErr
+	}
+
+	// NUT-20: if any quote is locked, signatures[i] must verify over
+	// quotes[i] + the full consolidated outputs (dual-accept framing).
+	anyLocked := false
+	for _, q := range quotes {
+		if q.Pubkey != nil {
+			anyLocked = true
+			break
+		}
+	}
+	if anyLocked && len(signatures) != len(quoteIds) {
+		return nil, cashu.MintQuoteInvalidSigErr
+	}
+
+	// claim every quote (Paid -> Pending). On any loss/failure, roll back
+	// the claims already taken.
+	claimed := make([]string, 0, len(quotes))
+	rollbackClaims := func() {
+		for _, id := range claimed {
+			if released, rbErr := m.db.UpdateMintQuoteStateCAS(id, nut04.Pending, nut04.Paid); rbErr != nil || !released {
+				m.logErrorf("batch mint rollback did not release quote '%v' (released=%v, err=%v) — quote may rest PENDING", id, released, rbErr)
+			}
+		}
+	}
+	for i, q := range quotes {
+		if q.Pubkey != nil {
+			sigHex := signatures[i]
+			if sigHex == "" {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+			sigBytes, err := hex.DecodeString(sigHex)
+			if err != nil {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+			sig, err := schnorr.ParseSignature(sigBytes)
+			if err != nil {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+			if !nut20.VerifyMintQuoteSignature(sig, q.Id, outputs, q.Pubkey) {
+				rollbackClaims()
+				return nil, cashu.MintQuoteInvalidSigErr
+			}
+		}
+		claimedOk, err := m.db.UpdateMintQuoteStateCAS(q.Id, nut04.Paid, nut04.Pending)
+		if err != nil {
+			rollbackClaims()
+			errmsg := fmt.Sprintf("error claiming mint quote '%v': %v", q.Id, err)
+			return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+		}
+		if !claimedOk {
+			rollbackClaims()
+			return nil, cashu.QuotePending
+		}
+		claimed = append(claimed, q.Id)
+	}
+
+	// sign the consolidated outputs once
+	blindedSignatures, err := m.signBlindedMessages(outputs)
+	if err != nil {
+		rollbackClaims()
+		return nil, err
+	}
+
+	// persist signatures, then mark every quote Issued (claim-holder only)
+	B_s := make([]string, len(outputs))
+	for i, bm := range outputs {
+		B_s[i] = bm.B_
+	}
+	if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
+		rollbackClaims()
+		errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
+		return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	}
+	for _, q := range quotes {
+		issued, err := m.db.UpdateMintQuoteStateCAS(q.Id, nut04.Pending, nut04.Issued)
+		if err != nil || !issued {
+			rollbackClaims()
+			errmsg := fmt.Sprintf("quote '%v' left PENDING before batch issuance completed (issued=%v, err=%v)", q.Id, issued, err)
+			return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+		}
+		jsonQuote, _ := json.Marshal(q)
+		m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
+	}
+
+	return blindedSignatures, nil
+}
+
+// CheckMintQuotesBatch returns the states of the given bolt11 mint quotes
+// in request order (NUT-29 batch check). All-or-nothing: an unknown id
+// rejects the whole request.
+func (m *Mint) CheckMintQuotesBatch(quoteIds []string) ([]storage.MintQuote, error) {
+	if len(quoteIds) == 0 {
+		return nil, cashu.NoProofsProvided
+	}
+	if len(quoteIds) > BatchCheckLimit {
+		return nil, cashu.BuildCashuError(
+			fmt.Sprintf("batch too large: max %d quote ids", BatchCheckLimit), cashu.StandardErrCode)
+	}
+	quotes := make([]storage.MintQuote, len(quoteIds))
+	for i, id := range quoteIds {
+		quote, err := m.GetMintQuoteState(id)
+		if err != nil {
+			return nil, err
+		}
+		quotes[i] = quote
+	}
+	return quotes, nil
+}
+
+// storedSignaturesFor reports whether the FULL output set is already
+// signed in the db and returns those signatures — the retry/recovery
+// signal for a Pending or Issued quote (a partial match is not a retry).
+func (m *Mint) storedSignaturesFor(outputs cashu.BlindedMessages) (cashu.BlindedSignatures, bool) {
+	if len(outputs) == 0 {
+		return nil, false
+	}
+	B_s := make([]string, len(outputs))
+	for i, bm := range outputs {
+		B_s[i] = bm.B_
+	}
+	sigs, err := m.db.GetBlindSignatures(B_s)
+	if err != nil || len(sigs) != len(outputs) {
+		return nil, false
+	}
+	return sigs, true
+}
 
 func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.BlindedSignatures, error) {
 	// NUT #04: The total output amount **MUST NOT** exceed the quote's currently mintable amount, `amount_paid - amount_issued`.
@@ -389,10 +590,32 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 
 	var blindedSignatures cashu.BlindedSignatures
 
+	// NUT-19/recovery: for Pending and Issued quotes, if the FULL output
+	// set is already signed in the db, this is a retry of a mint that
+	// completed (or crashed after SaveBlindSignatures but before the
+	// Issued write) — replay the stored signatures and complete the state
+	// machine instead of erroring (cashu-audit #59 crash-consistency: the
+	// client must be able to learn its signatures after any crash point).
+	if mintQuote.State == nut04.Pending || mintQuote.State == nut04.Issued {
+		if stored, ok := m.storedSignaturesFor(mintTokensRequest.Outputs); ok {
+			if mintQuote.State == nut04.Pending {
+				// crash window: signatures saved, Issued write lost — finish it
+				if issued, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Pending, nut04.Issued); err != nil || !issued {
+					m.logErrorf("mint quote '%v' recovery could not complete Pending->Issued (issued=%v, err=%v)", mintQuote.Id, issued, err)
+				}
+			}
+			m.logDebugf("replaying stored signatures for mint quote '%v' (state %v)", mintQuote.Id, mintQuote.State)
+			return stored, nil
+		}
+	}
+
 	switch mintQuote.State {
 	case nut04.Unpaid:
 		return nil, cashu.MintQuoteRequestNotPaid
 	case nut04.Issued:
+		// Issued with NO stored signatures for these outputs: the
+		// pre-saga crash shape — value stranded, needs operator recovery.
+		m.logErrorf("mint quote '%v' is ISSUED but its signatures are not recoverable for these outputs", mintQuote.Id)
 		return nil, cashu.MintQuoteAlreadyIssued
 	case nut04.Pending:
 		return nil, cashu.QuotePending
@@ -475,7 +698,17 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 				return err
 			}
 
-			// mark quote as issued after signing the blinded messages —
+			// CRASH-CONSISTENCY ORDER (cashu-audit #59 saga): persist the
+			// signatures BEFORE the Issued write. A crash between the two
+			// leaves the quote Pending with recoverable signatures — the
+			// retry replays them and completes Pending->Issued (see the
+			// recovery head in MintTokens). The old order (Issued first)
+			// stranded the quote Issued with nothing deliverable.
+			if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
+				errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
+				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+			}
+
 			// Pending->Issued conditionally: only the claim-holder reaches
 			// here, so a loss means unexpected concurrent state surgery.
 			mintQuote.State = nut04.Issued
@@ -487,10 +720,6 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 			if !issued {
 				m.logErrorf("mint quote '%v' left PENDING before its claim-holder could mark it ISSUED — concurrent writer detected", mintQuote.Id)
 				return cashu.BuildCashuError("mint quote state changed underneath issuance", cashu.DBErrCode)
-			}
-			if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
-				errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
-				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
 
 			jsonQuote, _ := json.Marshal(mintQuote)
@@ -516,6 +745,23 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 	}
 
 	return blindedSignatures, nil
+}
+
+// verifySigAllGroup dispatches spec SIG_ALL group verification by
+// condition kind: P2PK (nut11) or HTLC (nut14). Both use the same
+// aggregated first-input message; the witness type and receiver-path
+// semantics differ (tollgate #809).
+func (m *Mint) verifySigAllGroup(proofs cashu.Proofs, outputs cashu.BlindedMessages, quoteId string) error {
+	first, err := nut10.DeserializeSecret(proofs[0].Secret)
+	if err != nil {
+		return err
+	}
+	switch first.Kind {
+	case nut10.HTLC:
+		return nut14.VerifySigAllHTLCProofs(proofs, outputs, quoteId)
+	default:
+		return nut11.VerifySigAllProofs(proofs, outputs, quoteId)
+	}
 }
 
 // swapClaimMarker rides the pending_proofs.melt_quote_id column for swap
@@ -591,7 +837,7 @@ func (m *Mint) Swap(proofs cashu.Proofs, blindedMessages cashu.BlindedMessages) 
 	// FIRST input only)
 	if nut11.ProofsSigAll(proofs) {
 		m.logDebugf("locked proofs have SIG_ALL flag. Verifying first-input aggregate witness")
-		if err := nut11.VerifySigAllProofs(proofs, blindedMessages, ""); err != nil {
+		if err := m.verifySigAllGroup(proofs, blindedMessages, ""); err != nil {
 			return nil, err
 		}
 	}
@@ -755,33 +1001,62 @@ func (m *Mint) GetMeltQuoteState(ctx context.Context, quoteId string) (storage.M
 		return storage.MeltQuote{}, cashu.QuoteNotExistErr
 	}
 
-	// if quote is pending, check with backend if status of payment has changed
+	// if quote is pending, check with backend if status of payment has changed.
+	// NEVER for a quote whose MeltTokens call is in flight — reconciling
+	// underneath an active melt double-settles (the marker clears when the
+	// call returns, so crash orphans reconcile on their first poll).
 	if meltQuote.State == nut05.Pending {
+		if _, inFlight := m.meltInFlight.Load(meltQuote.Id); inFlight {
+			return meltQuote, nil
+		}
 		m.logDebugf("checking status of payment with hash '%v' for melt quote '%v'",
 			meltQuote.PaymentHash, meltQuote.Id)
 
 		paymentStatus, err := m.lightningClient.OutgoingPaymentStatus(ctx, meltQuote.PaymentHash)
 		if err != nil {
+			// A not-found outgoing payment is definitive: nothing was ever
+			// paid (crash between the quote claim and the payment attempt —
+			// the orphan that previously rested PENDING forever). Same
+			// verdict as MeltTokens' own failure path: release the claim
+			// and the pending proofs so the quote stays retryable.
+			if errors.Is(err, lightning.OutgoingPaymentNotFound) || status.Code(err) == codes.NotFound {
+				m.logInfof("no outgoing payment found for hash %v. Releasing orphaned claim on melt quote '%v' back to UNPAID",
+					meltQuote.PaymentHash, meltQuote.Id)
+				released, rbErr := m.db.UpdateMeltQuoteStateCAS(meltQuote.Id, nut05.Pending, nut05.Unpaid)
+				if rbErr != nil {
+					errmsg := fmt.Sprintf("error releasing orphaned melt quote: %v", rbErr)
+					return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+				}
+				if released {
+					if _, err := m.removePendingProofsForQuote(meltQuote.Id); err != nil {
+						errmsg := fmt.Sprintf("error removing pending proofs for quote: %v", err)
+						return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+					}
+					meltQuote.State = nut05.Unpaid
+				}
+				return meltQuote, nil
+			}
 			m.logErrorf(`error checking outgoing payment status: %v. Leaving proofs for quote '%v' as pending`,
 				err, meltQuote.Id)
 			return meltQuote, nil
 		}
 
 		switch paymentStatus.PaymentStatus {
-		// settle proofs (remove pending, and add to used)
-		// mark quote as paid and set preimage
+		// settle proofs (remove pending, and add to used — ONE transaction:
+		// the two-statement form left the same re-claim window the melt path
+		// fixed) and mark quote as paid with preimage
 		case lightning.Succeeded:
 			m.logInfof("payment %v succeded. setting melt quote '%v' to paid and invalidating proofs",
 				meltQuote.PaymentHash, meltQuote.Id)
 
-			proofs, err := m.removePendingProofsForQuote(meltQuote.Id)
+			proofs, Ys, err := m.pendingProofsForQuote(meltQuote.Id)
 			if err != nil {
-				errmsg := fmt.Sprintf("error removing pending proofs for quote: %v", err)
+				errmsg := fmt.Sprintf("error loading pending proofs for quote: %v", err)
 				return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
-			err = m.db.SaveProofs(proofs)
+			err = m.db.SettleProofs(Ys, proofs)
 			if err != nil {
-				errmsg := fmt.Sprintf("error invalidating proofs. Could not save proofs to db: %v", err)
+				errmsg := fmt.Sprintf("error settling proofs for quote (pending->used must be atomic): %v", err)
 				return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
 
@@ -844,6 +1119,29 @@ func (m *Mint) removePendingProofsForQuote(quoteId string) (cashu.Proofs, error)
 	return proofs, nil
 }
 
+// pendingProofsForQuote loads a quote's pending proofs and Ys WITHOUT
+// removing them — for the atomic SettleProofs path (pending->used in one
+// transaction; the remove+save two-statement form left a re-claim window).
+func (m *Mint) pendingProofsForQuote(quoteId string) (cashu.Proofs, []string, error) {
+	dbproofs, err := m.db.GetPendingProofsByQuote(quoteId)
+	if err != nil {
+		return nil, nil, err
+	}
+	proofs := make(cashu.Proofs, len(dbproofs))
+	Ys := make([]string, len(dbproofs))
+	for i, dbproof := range dbproofs {
+		Ys[i] = dbproof.Y
+		proofs[i] = cashu.Proof{
+			Amount:  dbproof.Amount,
+			Id:      dbproof.Id,
+			Secret:  dbproof.Secret,
+			C:       dbproof.C,
+			Witness: dbproof.Witness,
+		}
+	}
+	return proofs, Ys, nil
+}
+
 // MeltTokens verifies whether proofs provided are valid
 // and proceeds to attempt payment.
 func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltBolt11Request) (storage.MeltQuote, error) {
@@ -891,7 +1189,7 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 	// never claim the quote (fund-safety: local validation precedes
 	// irreversible state changes). tollgate #809 / cashu-audit #59 P1.
 	if nut11.ProofsSigAll(proofs) {
-		if err := nut11.VerifySigAllProofs(proofs, meltTokensRequest.Outputs, meltQuote.Id); err != nil {
+		if err := m.verifySigAllGroup(proofs, meltTokensRequest.Outputs, meltQuote.Id); err != nil {
 			return storage.MeltQuote{}, err
 		}
 		m.logDebugf("verified SIG_ALL melt witness (aggregate + quote id)")
@@ -911,6 +1209,9 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 	if !claimed {
 		return storage.MeltQuote{}, cashu.QuotePending
 	}
+	// mark in-flight for the poll-path reconciler; released on every exit
+	m.meltInFlight.Store(meltQuote.Id, struct{}{})
+	defer m.meltInFlight.Delete(meltQuote.Id)
 	meltQuote.State = nut05.Pending
 
 	// set proofs as pending before trying to make payment (the per-Y guard:
@@ -1251,10 +1552,11 @@ func (m *Mint) verifyProofs(proofs cashu.Proofs, Ys []string) error {
 		// if P2PK locked proof, verify valid witness
 		nut10Secret, err := nut10.DeserializeSecret(proof.Secret)
 		if err == nil {
-			if nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
-				// SIG_ALL witnesses live only in the FIRST input and sign
-				// the aggregated transaction message — verified as a group
-				// by the caller (VerifySigAllProofs), not per-input here.
+			if nut11.IsSigAll(nut10Secret) {
+				// SIG_ALL witnesses (P2PK and HTLC alike) live only in the
+				// FIRST input and sign the aggregated transaction message —
+				// verified as a group by the caller (verifySigAllGroup),
+				// not per-input here.
 				m.logDebugf("SIG_ALL input — deferring to group verification")
 			} else if nut10Secret.Kind == nut10.P2PK {
 				if err := nut11.VerifyP2PKLockedProof(proof, nut10Secret); err != nil {
@@ -1642,9 +1944,15 @@ func (m *Mint) SetMintInfo(mintInfo MintInfo) {
 			CachedEndpoints: []nut06.CachedEndpoint{
 				{Method: "POST", Path: "/v1/mint/bolt11"},
 				{Method: "POST", Path: "/v1/swap"},
+				{Method: "POST", Path: "/v1/melt/bolt11"},
 			},
 		},
 		Nut20: nut06.Supported{Supported: true},
+		Nut29: nut06.Nut29Setting{
+			Supported:           true,
+			MaxBatchSize:        BatchCheckLimit,
+			MaxBatchOutputsSize: BatchMaxOutputs,
+		},
 	}
 
 	if m.mppEnabled {
@@ -1670,7 +1978,7 @@ func (m *Mint) SetMintInfo(mintInfo MintInfo) {
 	m.mintInfo = info
 }
 
-func (m Mint) RetrieveMintInfo() (nut06.MintInfo, error) {
+func (m *Mint) RetrieveMintInfo() (nut06.MintInfo, error) {
 	seed, err := m.db.GetSeed()
 	if err != nil {
 		return nut06.MintInfo{}, err

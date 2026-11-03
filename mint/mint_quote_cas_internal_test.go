@@ -215,3 +215,26 @@ func TestSwapSameProofsConcurrentDoubleSpend(t *testing.T) {
 		}
 	}
 }
+
+// internalTestOutputsAmounts builds one output per requested amount.
+func internalTestOutputsAmounts(keysetId string, amounts []uint64) (cashu.BlindedMessages, []string, []*secp256k1.PrivateKey) {
+	outputs := make(cashu.BlindedMessages, len(amounts))
+	secrets := make([]string, len(amounts))
+	rs := make([]*secp256k1.PrivateKey, len(amounts))
+	for i, amt := range amounts {
+		secretBytes := make([]byte, 32)
+		rand.Read(secretBytes)
+		secrets[i] = hex.EncodeToString(secretBytes)
+		r, err := secp256k1.GeneratePrivateKey()
+		if err != nil {
+			panic(err)
+		}
+		rs[i] = r
+		B_, _, err := crypto.BlindMessage(secrets[i], r)
+		if err != nil {
+			panic(err)
+		}
+		outputs[i] = cashu.NewBlindedMessage(keysetId, amt, B_)
+	}
+	return outputs, secrets, rs
+}

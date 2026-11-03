@@ -200,3 +200,157 @@ func VerifyHTLCProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret) error
 
 	return nil
 }
+
+// VerifySigAllHTLCProofs verifies a spec-conformant HTLC SIG_ALL
+// transaction: the witness lives ONLY in the first input (HTLCWitness:
+// preimage + signatures) and the signatures are Schnorr signatures over
+// sha256(nut11.SigAllMessage(inputs, outputs, quoteId)) — the same
+// aggregate as P2PK SIG_ALL (tollgate #809 / cashu-audit #59: the HTLC
+// arm of the spec alignment).
+//
+// Semantics mirror VerifyHTLCProof: locktime expiry is additive (refund
+// keys over the aggregate accepted, receiver path still accepted, no
+// refund keys = anyone-can-spend); the receiver path requires a preimage
+// hashing to Secret.data, plus aggregate signatures when the pubkeys tag
+// (or n_sigs) demands them.
+func VerifySigAllHTLCProofs(inputs cashu.Proofs, outputs cashu.BlindedMessages, quoteId string) error {
+	if len(inputs) == 0 {
+		return cashu.NoProofsProvided
+	}
+
+	firstSecret, err := nut10.DeserializeSecret(inputs[0].Secret)
+	if err != nil {
+		return err
+	}
+	if firstSecret.Kind != nut10.HTLC {
+		errmsg := "VerifySigAllHTLCProofs requires HTLC conditions"
+		return cashu.BuildCashuError(errmsg, NUT14ErrCode)
+	}
+
+	// NUT-11: if one input is SIG_ALL, all inputs MUST share the same
+	// Secret.data and Secret.tags.
+	for _, proof := range inputs {
+		secret, err := nut10.DeserializeSecret(proof.Secret)
+		if err != nil {
+			return err
+		}
+		if secret.Kind != nut10.HTLC || !nut11.IsSigAll(secret) {
+			return nut11.AllSigAllFlagsErr
+		}
+		if secret.Data.Data != firstSecret.Data.Data || len(secret.Data.Tags) != len(firstSecret.Data.Tags) {
+			return nut11.SigAllInputsNotUniformErr
+		}
+		for i := range secret.Data.Tags {
+			if !slices.Equal(secret.Data.Tags[i], firstSecret.Data.Tags[i]) {
+				return nut11.SigAllInputsNotUniformErr
+			}
+		}
+	}
+
+	p2pkTags, err := nut11.ParseP2PKTags(firstSecret.Data.Tags)
+	if err != nil {
+		return err
+	}
+
+	var witness HTLCWitness
+	if inputs[0].Witness != "" {
+		if err := json.Unmarshal([]byte(inputs[0].Witness), &witness); err != nil {
+			return nut11.InvalidWitness
+		}
+	}
+
+	msgHash := sha256.Sum256(nut11.SigAllMessage(inputs, outputs, quoteId))
+
+	// Locktime semantics: expiry ADDS the refund pathway.
+	if p2pkTags.Locktime > 0 && time.Now().Unix() > p2pkTags.Locktime {
+		if len(p2pkTags.Refund) == 0 {
+			// no refund keys: unlocked after expiry, spendable by anyone
+			return nil
+		}
+		if nut11.HasDuplicateKeys(p2pkTags.Refund) {
+			return nut11.DuplicatePubkeysErr
+		}
+		if len(witness.Signatures) >= 1 && !nut11.DuplicateSignatures(witness.Signatures) {
+			refundRequired := 1
+			if p2pkTags.NSigsRefund > 0 {
+				refundRequired = p2pkTags.NSigsRefund
+			}
+			if nut11.HasValidSignatures(msgHash[:], witness.Signatures, refundRequired, p2pkTags.Refund) {
+				return nil
+			}
+		}
+		// refund path did not verify — fall through to the receiver path
+	}
+
+	// Receiver path: the preimage must hash to Secret.data.
+	preimageBytes, err := hex.DecodeString(witness.Preimage)
+	if err != nil {
+		return InvalidPreimageErr
+	}
+	hashBytes := sha256.Sum256(preimageBytes)
+	hash := hex.EncodeToString(hashBytes[:])
+	if len(firstSecret.Data.Data) != 64 {
+		return InvalidHashErr
+	}
+	if hash != firstSecret.Data.Data {
+		return InvalidPreimageErr
+	}
+
+	// Aggregate signatures when the pubkeys tag (or n_sigs) demands them.
+	verifySigs := p2pkTags.NSigs
+	if verifySigs == 0 && len(p2pkTags.Pubkeys) > 0 {
+		verifySigs = 1
+	}
+	if verifySigs > 0 {
+		if nut11.HasDuplicateKeys(p2pkTags.Pubkeys) {
+			return nut11.DuplicatePubkeysErr
+		}
+		if len(witness.Signatures) < 1 {
+			return nut11.NoSignaturesErr
+		}
+		if nut11.DuplicateSignatures(witness.Signatures) {
+			return nut11.DuplicateSignaturesErr
+		}
+		if !nut11.HasValidSignatures(msgHash[:], witness.Signatures, verifySigs, p2pkTags.Pubkeys) {
+			return nut11.NotEnoughSignaturesErr
+		}
+	}
+
+	return nil
+}
+
+// AddSigAllHTLCToFirstInput produces the spec-conformant HTLC SIG_ALL
+// witness: the preimage and the aggregate signatures go ONLY in the
+// first input's witness (tollgate #809: gonuts previously signed each
+// output's B_ — a construction no other implementation accepts).
+func AddSigAllHTLCToFirstInput(
+	inputs cashu.Proofs,
+	outputs cashu.BlindedMessages,
+	quoteId string,
+	preimage string,
+	signingKeys ...*btcec.PrivateKey,
+) (cashu.Proofs, error) {
+	if len(inputs) == 0 {
+		return nil, cashu.NoProofsProvided
+	}
+	msgHash := sha256.Sum256(nut11.SigAllMessage(inputs, outputs, quoteId))
+
+	signatures := make([]string, 0, len(signingKeys))
+	for _, key := range signingKeys {
+		signature, err := schnorr.Sign(key, msgHash[:])
+		if err != nil {
+			return nil, err
+		}
+		signatures = append(signatures, hex.EncodeToString(signature.Serialize()))
+	}
+
+	witness, err := json.Marshal(HTLCWitness{Preimage: preimage, Signatures: signatures})
+	if err != nil {
+		return nil, err
+	}
+	inputs[0].Witness = string(witness)
+	for i := 1; i < len(inputs); i++ {
+		inputs[i].Witness = ""
+	}
+	return inputs, nil
+}

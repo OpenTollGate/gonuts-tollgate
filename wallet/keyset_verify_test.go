@@ -39,7 +39,15 @@ func TestVerifyKeysetIdAcceptsHonestV1(t *testing.T) {
 func TestVerifyKeysetIdRejectsForgedV1(t *testing.T) {
 	keys := verifyTestKeys(t)
 	id := crypto.DeriveKeysetId(keys)
-	forged := id[:15] + "f"
+	// flip the 16th nibble to a char that DIFFERS from the honest one —
+	// with random keys the honest char is 'f' 1/16 of the time and a
+	// hardcoded 'f' made this fixture self-defeating (the flaky-test
+	// signature observed across full-tree runs)
+	flip := byte('f')
+	if id[15] == 'f' {
+		flip = '0'
+	}
+	forged := id[:15] + string(flip)
 	if forged == id {
 		t.Fatal("fixture must actually differ from the derived ID")
 	}

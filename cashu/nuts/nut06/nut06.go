@@ -108,6 +108,15 @@ type Nuts struct {
 	Nut17 nut17.InfoSetting `json:"17"`
 	Nut19 Nut19Setting      `json:"19"`
 	Nut20 Supported         `json:"20"`
+	Nut29 Nut29Setting      `json:"29"`
+}
+
+// Nut29Setting advertises NUT-29 batch support and its limits
+// (nuts/29.md: implementations MAY impose maximum batch sizes).
+type Nut29Setting struct {
+	Supported           bool `json:"supported"`
+	MaxBatchSize        int  `json:"max_batch_size"`
+	MaxBatchOutputsSize int  `json:"max_batch_outputs_size"`
 }
 
 // custom unmarshaller because format to signal support for nut-15 changed.
@@ -128,6 +137,7 @@ func (nuts *Nuts) UnmarshalJSON(data []byte) error {
 		Nut17 nut17.InfoSetting `json:"17"`
 		Nut19 Nut19Setting      `json:"19"`
 		Nut20 Supported         `json:"20"`
+		Nut29 Nut29Setting      `json:"29"`
 	}
 
 	if err := json.Unmarshal(data, &tempNuts); err != nil {
@@ -146,6 +156,7 @@ func (nuts *Nuts) UnmarshalJSON(data []byte) error {
 	nuts.Nut17 = tempNuts.Nut17
 	nuts.Nut19 = tempNuts.Nut19
 	nuts.Nut20 = tempNuts.Nut20
+	nuts.Nut29 = tempNuts.Nut29
 
 	if err := json.Unmarshal(tempNuts.Nut15, &nuts.Nut15); err != nil {
 		var nut15Methods []MethodSetting
