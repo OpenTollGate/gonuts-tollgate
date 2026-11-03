@@ -137,19 +137,26 @@ func VerifyHTLCProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret) error
 
 	// if locktime is expired and there is no refund pubkey, treat as anyone can spend
 	// if refund pubkey present, check signature
+	// NUT-11/14: locktime expiry ADDS the refund keys as an alternative
+	// path — it does NOT revoke the receiver (preimage + primary) path
+	// (cashu-audit #59: receiver-path-after-locktime must still verify;
+	// cdk and nutshell >=0.20.3 accept both).
 	if p2pkTags.Locktime > 0 && time.Now().Local().Unix() > p2pkTags.Locktime {
 		if len(p2pkTags.Refund) == 0 {
+			// no refund keys: anyone can spend after expiry
 			return nil
-		} else {
+		}
+		if len(htlcWitness.Signatures) >= 1 {
 			hash := sha256.Sum256([]byte(proof.Secret))
-			if len(htlcWitness.Signatures) < 1 {
-				return nut11.InvalidWitness
+			refundRequired := 1
+			if p2pkTags.NSigsRefund > 0 {
+				refundRequired = p2pkTags.NSigsRefund
 			}
-			if !nut11.HasValidSignatures(hash[:], htlcWitness.Signatures, 1, p2pkTags.Refund) {
-				return nut11.NotEnoughSignaturesErr
+			if nut11.HasValidSignatures(hash[:], htlcWitness.Signatures, refundRequired, p2pkTags.Refund) {
+				return nil
 			}
 		}
-		return nil
+		// refund path did not verify — fall through to the receiver path
 	}
 
 	// verify valid preimage
@@ -183,6 +190,9 @@ func VerifyHTLCProof(proof cashu.Proof, proofSecret nut10.WellKnownSecret) error
 			return nut11.DuplicateSignaturesErr
 		}
 
+		// NUT-11: signable set = primary key (secret.data is the hash for
+		// HTLC, so the primary SIGNING key rides the pubkeys tag; data-key
+		// union semantics preserved for the P2PK verifier) — keys as-is here.
 		if !nut11.HasValidSignatures(hash[:], htlcWitness.Signatures, verifySigs, p2pkTags.Pubkeys) {
 			return nut11.NotEnoughSignaturesErr
 		}

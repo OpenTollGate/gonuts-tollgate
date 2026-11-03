@@ -614,6 +614,24 @@ func (sqlite *SQLiteDB) UpdateMeltQuote(quoteId, preimage string, state nut05.St
 	return nil
 }
 
+// UpdateMeltQuoteStateCAS atomically claims a melt-quote state transition:
+// the UPDATE's WHERE clause carries the expected prior state, so exactly
+// one concurrent caller flips the row; losers see zero rows affected.
+func (sqlite *SQLiteDB) UpdateMeltQuoteStateCAS(quoteId string, from nut05.State, to nut05.State) (bool, error) {
+	result, err := sqlite.db.Exec(
+		"UPDATE melt_quotes SET state = ? WHERE id = ? AND state = ?",
+		to.String(), quoteId, from.String(),
+	)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return count == 1, nil
+}
+
 func (sqlite *SQLiteDB) SaveBlindSignatures(B_s []string, blindSignatures cashu.BlindedSignatures) error {
 	tx, err := sqlite.db.Begin()
 	if err != nil {

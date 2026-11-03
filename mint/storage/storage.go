@@ -32,6 +32,13 @@ type MintDB interface {
 	// used to check if a melt quote already exists for the passed invoice
 	GetMeltQuoteByPaymentRequest(string) (*MeltQuote, error)
 	UpdateMeltQuote(quoteId string, preimage string, state nut05.State) error
+	// UpdateMeltQuoteStateCAS atomically transitions a melt quote from
+	// `from` to `to` and reports whether THIS call won the transition.
+	// Returns (false, nil) when the row exists but is no longer in `from`
+	// (the race loser). Guards the melt path against concurrent
+	// double-settlement of one quote (cashu-audit #59 P0 — the gonuts
+	// variant of the cashu-cf #41 TOCTOU).
+	UpdateMeltQuoteStateCAS(quoteId string, from nut05.State, to nut05.State) (bool, error)
 
 	SaveBlindSignatures(B_s []string, blindSignatures cashu.BlindedSignatures) error
 	GetBlindSignature(B_ string) (cashu.BlindedSignature, error)
