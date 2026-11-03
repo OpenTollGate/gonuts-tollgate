@@ -40,6 +40,12 @@ type MintDB interface {
 	// variant of the cashu-cf #41 TOCTOU).
 	UpdateMeltQuoteStateCAS(quoteId string, from nut05.State, to nut05.State) (bool, error)
 
+	// UpdateMintQuoteStateCAS atomically transitions a mint quote from
+	// `from` to `to` and reports whether THIS call won the transition.
+	// (false, nil) = race loser. Guards MintTokens against concurrent
+	// double issuance on one paid quote (cashu-audit #59).
+	UpdateMintQuoteStateCAS(quoteId string, from nut04.State, to nut04.State) (bool, error)
+
 	// SettleProofs atomically moves proofs from pending to used in ONE
 	// transaction (delete-pending + insert-used). The two-statement form
 	// left a re-claim window between the statements — the same-proofs

@@ -346,15 +346,26 @@ func (m *Mint) GetMintQuoteState(quoteId string) (storage.MintQuote, error) {
 
 		if status.Settled {
 			m.logInfof("mint quote '%v' with invoice payment hash '%v' was paid", mintQuote.Id, mintQuote.PaymentHash)
-			mintQuote.State = nut04.Paid
-			err := m.db.UpdateMintQuoteState(mintQuote.Id, mintQuote.State)
+			// Unpaid->Paid ONLY (conditional): the read above is advisory;
+			// between it and this write a concurrent minter may have
+			// claimed the quote (Pending) — an unconditional write would
+			// resurrect Paid and open a second claim (double issuance).
+			claimed, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Unpaid, nut04.Paid)
 			if err != nil {
 				errmsg := fmt.Sprintf("error updating mint quote in db: %v", err)
 				return storage.MintQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
-
-			jsonQuote, _ := json.Marshal(mintQuote)
-			m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
+			if !claimed {
+				// someone advanced the quote past UNPAID — return their truth
+				fresh, err := m.db.GetMintQuote(mintQuote.Id)
+				if err == nil {
+					mintQuote = fresh
+				}
+			} else {
+				mintQuote.State = nut04.Paid
+				jsonQuote, _ := json.Marshal(mintQuote)
+				m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
+			}
 		}
 	}
 
@@ -363,6 +374,12 @@ func (m *Mint) GetMintQuoteState(quoteId string) (storage.MintQuote, error) {
 
 // MintTokens verifies whether the mint quote with id has been paid and proceeds to
 // sign the blindedMessages and return the BlindedSignatures if it was paid.
+	// mintQuoteClaimBarrier is a test seam (the postMeltBolt11 pattern):
+// invoked between the quote read and the Paid->Pending CAS claim in
+// MintTokens, so tests can deterministically stage both callers past the
+// read before either claims — the double-issuance race window.
+var mintQuoteClaimBarrier = func() {}
+
 func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.BlindedSignatures, error) {
 	// NUT #04: The total output amount **MUST NOT** exceed the quote's currently mintable amount, `amount_paid - amount_issued`.
 	mintQuote, err := m.GetMintQuoteState(mintTokensRequest.Quote)
@@ -381,11 +398,20 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 		return nil, cashu.QuotePending
 	case nut04.Paid:
 		err := func() error {
-			// set quote as pending while validating blinded messages and signing
-			err = m.db.UpdateMintQuoteState(mintQuote.Id, nut04.Pending)
+			// Atomically claim the quote Paid->Pending before any signing
+			// work. The read-check above is advisory; THIS is the guard:
+			// two concurrent MintTokens on one paid quote (with disjoint
+			// outputs) both passed it, both unconditionally wrote Pending,
+			// and both signed — double issuance for one payment (the
+			// mint-side sibling of the melt-quote TOCTOU, cashu-audit #59).
+			mintQuoteClaimBarrier()
+			claimed, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Paid, nut04.Pending)
 			if err != nil {
-				errmsg := fmt.Sprintf("error mint quote state: %v", err)
+				errmsg := fmt.Sprintf("error claiming mint quote state: %v", err)
 				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+			}
+			if !claimed {
+				return cashu.QuotePending
 			}
 
 			blindedMessages := mintTokensRequest.Outputs
@@ -449,11 +475,18 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 				return err
 			}
 
-			// mark quote as issued after signing the blinded messages
+			// mark quote as issued after signing the blinded messages —
+			// Pending->Issued conditionally: only the claim-holder reaches
+			// here, so a loss means unexpected concurrent state surgery.
 			mintQuote.State = nut04.Issued
-			if err := m.db.UpdateMintQuoteState(mintQuote.Id, nut04.Issued); err != nil {
+			issued, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Pending, nut04.Issued)
+			if err != nil {
 				errmsg := fmt.Sprintf("error updating mint quote state: %v", err)
 				return cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+			}
+			if !issued {
+				m.logErrorf("mint quote '%v' left PENDING before its claim-holder could mark it ISSUED — concurrent writer detected", mintQuote.Id)
+				return cashu.BuildCashuError("mint quote state changed underneath issuance", cashu.DBErrCode)
 			}
 			if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
 				errmsg := fmt.Sprintf("error saving blind signatures: %v", err)
@@ -465,10 +498,18 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 			return nil
 		}()
 
-		// update mint quote to previous state if there was an error
+		// release the claim on error so a corrected retry stays possible.
+		// The rollback is itself conditional (Pending->Paid): we only ever
+		// write back the state WE hold. A rollback failure means the row
+		// moved underneath us — log loudly, it needs operator eyes (same
+		// posture as the melt-path rollback).
 		if err != nil {
-			if err := m.db.UpdateMintQuoteState(mintQuote.Id, mintQuote.State); err != nil {
-				return nil, err
+			if err != cashu.QuotePending {
+				released, rbErr := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Pending, nut04.Paid)
+				if rbErr != nil || !released {
+					m.logErrorf("mint quote '%v' rollback after failure did not release the claim (released=%v, err=%v) — quote may rest PENDING: %v",
+						mintQuote.Id, released, rbErr, err)
+				}
 			}
 			return nil, err
 		}
@@ -476,6 +517,17 @@ func (m *Mint) MintTokens(mintTokensRequest nut04.PostMintBolt11Request) (cashu.
 
 	return blindedSignatures, nil
 }
+
+// swapClaimMarker rides the pending_proofs.melt_quote_id column for swap
+// claims (swaps have no quote to serialize on — the proof set itself is
+// the claim key).
+const swapClaimMarker = "swap"
+
+// swapClaimBarrier is a test seam (the postMeltBolt11 pattern): invoked
+// between Swap's read-checks and the proof claim, so tests can stage both
+// callers past verification before either claims — the same-proofs
+// double-spend race window.
+var swapClaimBarrier = func() {}
 
 // Swap will process a request to swap tokens.
 // A swap requires a set of valid proofs and blinded messages.
@@ -544,15 +596,35 @@ func (m *Mint) Swap(proofs cashu.Proofs, blindedMessages cashu.BlindedMessages) 
 		}
 	}
 
+	// Atomically claim the input proofs BEFORE signing (the swap-side
+	// sibling of the quote CAS — cashu-audit #59): two concurrent swaps
+	// with the SAME proofs both passed the read-checks above and both
+	// signed — a double spend. The pending-insert (unique secret + the
+	// in-tx used-check) is the race verdict; the loser gets a pending/
+	// spent error and signs nothing.
+	swapClaimBarrier()
+	if err := m.db.AddPendingProofs(proofs, swapClaimMarker); err != nil {
+		if errors.Is(err, cashu.ProofAlreadyUsedErr) {
+			return nil, cashu.ProofAlreadyUsedErr
+		}
+		errmsg := fmt.Sprintf("error claiming swap proofs: %v", err)
+		return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	}
+
 	// if verification complete, sign blinded messages
 	blindedSignatures, err := m.signBlindedMessages(blindedMessages)
 	if err != nil {
+		// release the claim so a corrected retry stays possible
+		if rmErr := m.db.RemovePendingProofs(Ys); rmErr != nil {
+			m.logErrorf("swap proof-claim rollback failed (proofs may rest PENDING): %v (sign error: %v)", rmErr, err)
+		}
 		return nil, err
 	}
 
-	// invalidate proofs after signing blinded messages
-	if err := m.db.SaveProofs(proofs); err != nil {
-		errmsg := fmt.Sprintf("error invalidating proofs. Could not save proofs to db: %v", err)
+	// invalidate proofs atomically (pending -> used in one transaction —
+	// the two-statement form left a re-claim window, see SettleProofs)
+	if err := m.db.SettleProofs(Ys, proofs); err != nil {
+		errmsg := fmt.Sprintf("error settling swap proofs (pending->used must be atomic): %v", err)
 		return nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 	if err := m.db.SaveBlindSignatures(B_s, blindedSignatures); err != nil {
@@ -1009,12 +1081,12 @@ func (m *Mint) settleQuotesInternally(
 		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 
-	// mark mint quote request as paid
+	// mark mint quote request as paid — Unpaid->Paid ONLY (conditional):
+	// a concurrent minter may have claimed it already; never resurrect
+	// Paid over Pending/Issued (double-issuance guard, cashu-audit #59).
 	mintQuote.State = nut04.Paid
-	err = m.db.UpdateMintQuoteState(mintQuote.Id, mintQuote.State)
-	if err != nil {
-		errmsg := fmt.Sprintf("error updating mint quote state: %v", err)
-		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	if _, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Unpaid, nut04.Paid); err != nil {
+		m.logErrorf("could not mark mint quote '%v' PAID during internal settle: %v", mintQuote.Id, err)
 	}
 	jsonQuote, _ := json.Marshal(mintQuote)
 	m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
