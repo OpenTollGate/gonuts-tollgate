@@ -71,6 +71,26 @@ type walletMint struct {
 type Config struct {
 	WalletPath     string
 	CurrentMintURL string
+	// Unit is the Cashu unit this wallet operates in. Empty means sat, which
+	// keeps every config written before custom units working unchanged.
+	//
+	// The unit selects which keyset the wallet reads at a mint that issues
+	// more than one, so it is not a label: a sat wallet against an mb-only
+	// mint cannot find an active keyset at all, and the resulting error
+	// ("could not find an active keyset for the unit") names nothing about
+	// the assumption that caused it.
+	Unit string
+}
+
+// normalizeUnit maps the empty string to sat and returns the canonical
+// lowercase spelling. Cashu units are lowercase on the wire, and a config that
+// says "MB" means the same thing as "mb".
+func normalizeUnit(unit string) string {
+	unit = strings.ToLower(strings.TrimSpace(unit))
+	if unit == "" {
+		return cashu.Sat.String()
+	}
+	return unit
 }
 
 func InitStorage(path string) (storage.WalletDB, error) {
@@ -125,7 +145,7 @@ func LoadWallet(config Config) (*Wallet, error) {
 		return nil, err
 	}
 
-	wallet := &Wallet{db: db, unit: cashu.Sat, masterKey: masterKey, privateKey: privateKey}
+	wallet := &Wallet{db: db, unit: cashu.Unit(normalizeUnit(config.Unit)), masterKey: masterKey, privateKey: privateKey}
 	wallet.mints, err = wallet.loadWalletMints()
 	if err != nil {
 		return nil, err
@@ -172,6 +192,11 @@ func (w *Wallet) Shutdown() error {
 	return w.db.Close()
 }
 
+// Unit reports the unit this wallet operates in ("sat" when unset).
+func (w *Wallet) Unit() string {
+	return w.unit.String()
+}
+
 // AddMint adds the mint to the list of mints trusted by the wallet
 func (w *Wallet) AddMint(mint string) (*walletMint, error) {
 	url, err := url.Parse(mint)
@@ -215,7 +240,7 @@ func (w *Wallet) AddMint(mint string) (*walletMint, error) {
 
 // GetBalance returns the total balance aggregated from all proofs
 func (w *Wallet) GetBalance() uint64 {
-	return w.db.GetProofs().Amount()
+	return w.db.GetProofsByKeysetUnit(w.unit.String()).Amount()
 }
 
 // GetBalanceByMints returns a map of string mint

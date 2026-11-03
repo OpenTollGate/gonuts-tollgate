@@ -310,6 +310,48 @@ func (db *BoltDB) GetProofs() cashu.Proofs {
 	return proofs
 }
 
+// GetProofsByKeysetUnit returns every proof whose keyset is denominated in
+// unit. Cashu proofs carry no unit of their own — the unit lives on the keyset
+// that signed them — so this resolves the unit through the keyset records
+// rather than guessing from the proof.
+//
+// This is the accessor that keeps a balance from being a meaningless number:
+// proofs in different units cannot be summed, and doing so would report funds
+// that do not exist (10 sats + 64 mb is not 74 of anything).
+func (db *BoltDB) GetProofsByKeysetUnit(unit string) cashu.Proofs {
+	proofs := cashu.Proofs{}
+	wanted := strings.ToLower(strings.TrimSpace(unit))
+
+	ids := map[string]struct{}{}
+	db.bolt.View(func(tx *bolt.Tx) error {
+		keysetsb := tx.Bucket([]byte(KEYSETS_BUCKET))
+		if keysetsb == nil {
+			return nil
+		}
+		return keysetsb.ForEach(func(mintURL, _ []byte) error {
+			mintBucket := keysetsb.Bucket(mintURL)
+			if mintBucket == nil {
+				return nil
+			}
+			return mintBucket.ForEach(func(_, v []byte) error {
+				var keyset crypto.WalletKeyset
+				if err := json.Unmarshal(v, &keyset); err != nil {
+					return nil
+				}
+				if strings.ToLower(keyset.Unit) == wanted {
+					ids[strings.ToLower(keyset.Id)] = struct{}{}
+				}
+				return nil
+			})
+		})
+	})
+
+	for id := range ids {
+		proofs = append(proofs, db.GetProofsByKeysetId(id)...)
+	}
+	return proofs
+}
+
 func (db *BoltDB) GetProofsByKeysetId(id string) cashu.Proofs {
 	proofs := cashu.Proofs{}
 
