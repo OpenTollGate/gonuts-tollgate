@@ -189,8 +189,10 @@ func (ms *MintServer) setupHttpServer(port int) {
 	r.HandleFunc("/v1/keysets", ms.getKeysetsList).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/keys/{id}", ms.getKeysetById).Methods(http.MethodGet, http.MethodOptions)
 	r.HandleFunc("/v1/mint/quote/{method}", ms.mintRequest).Methods(http.MethodGet, http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/mint/quote/{method}/check", ms.mintQuoteBatchCheck).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/mint/quote/{method}/{quote_id}", ms.mintQuoteState).Methods(http.MethodGet, http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/mint/{method}", ms.mintTokensRequest).Methods(http.MethodPost, http.MethodOptions)
+	r.HandleFunc("/v1/mint/{method}/batch", ms.mintTokensBatchRequest).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/swap", ms.swapRequest).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/melt/quote/{method}", ms.meltQuoteRequest).Methods(http.MethodPost, http.MethodOptions)
 	r.HandleFunc("/v1/melt/quote/{method}/{quote_id}", ms.meltQuoteState).Methods(http.MethodGet, http.MethodOptions)
@@ -228,6 +230,16 @@ func setupHeaders(next http.Handler) http.Handler {
 
 func amountPaidFromState(quote storage.MintQuote) uint64 {
 	if quote.State == nut04.Paid {
+		return quote.Amount
+	}
+	return 0
+}
+
+// amountIssuedFromState derives the NUT-04 amount_issued field: the
+// quote amount once the state is ISSUED (gonuts quotes are single-shot —
+// outputs are validated against the full amount at mint time).
+func amountIssuedFromState(quote storage.MintQuote) uint64 {
+	if quote.State == nut04.Issued {
 		return quote.Amount
 	}
 	return 0
@@ -379,7 +391,7 @@ func (ms *MintServer) mintRequest(rw http.ResponseWriter, req *http.Request) {
 		State:        mintQuote.State,
 		Expiry:       mintQuote.Expiry,
 		AmountPaid:   amountPaidFromState(mintQuote),
-		AmountIssued: 0,
+		AmountIssued: amountIssuedFromState(mintQuote),
 		UpdatedAt:    uint64(time.Now().Unix()),
 	}
 	if mintQuote.Pubkey != nil {
@@ -429,7 +441,7 @@ func (ms *MintServer) mintQuoteState(rw http.ResponseWriter, req *http.Request) 
 		State:        mintQuote.State,
 		Expiry:       mintQuote.Expiry,
 		AmountPaid:   amountPaidFromState(mintQuote),
-		AmountIssued: 0,
+		AmountIssued: amountIssuedFromState(mintQuote),
 		UpdatedAt:    uint64(time.Now().Unix()),
 	}
 	if mintQuote.Pubkey != nil {
@@ -667,10 +679,28 @@ func (ms *MintServer) meltTokens(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	var meltTokensRequest nut05.PostMeltBolt11Request
-	err := decodeJsonReqBody(req, &meltTokensRequest)
+	body, err := io.ReadAll(req.Body)
 	if err != nil {
+		ms.writeErr(rw, req, cashu.StandardErr)
+		return
+	}
+
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	var meltTokensRequest nut05.PostMeltBolt11Request
+	if err := decodeJsonReqBody(req, &meltTokensRequest); err != nil {
 		ms.writeErr(rw, req, err)
+		return
+	}
+
+	// NUT-19 replay cache: a byte-identical melt re-POST returns the
+	// cached response. Without this, a client that lost the first
+	// response gets an ambiguous MELT_ALREADY_PAID error and cannot tell
+	// whether its melt settled (cashu-audit #59 P3).
+	response, found := ms.cache.Get(req.Method + req.URL.String() + string(body))
+	if found {
+		ms.mint.logDebugf("returning cached response for melt tokens request on quote '%v'", meltTokensRequest.Quote)
+		ms.logRequest(req, http.StatusOK, "returning cached response on melt tokens request")
+		rw.Write(response)
 		return
 	}
 
@@ -719,6 +749,12 @@ func (ms *MintServer) meltTokens(rw http.ResponseWriter, req *http.Request) {
 
 	ms.logRequest(req, http.StatusOK,
 		"return from melt tokens for quote '%v'. Quote state: %s", meltQuote.Id, meltQuote.State)
+
+	// NUT-19: cache the successful response for replay (same key shape
+	// as the mint handler; bounded by request size).
+	if len(body) < REQUEST_BODY_SIZE_LIMIT {
+		ms.cache.Set(req.Method+req.URL.String()+string(body), jsonRes, time.Second*CACHE_ITEM_TTL)
+	}
 
 	rw.Write(jsonRes)
 }
@@ -839,4 +875,92 @@ func decodeJsonReqBody(req *http.Request, dst any) error {
 	}
 
 	return nil
+}
+
+// mintQuoteBatchCheck handles NUT-29 POST /v1/mint/quote/{method}/check:
+// states for a batch of quote ids, request order, all-or-nothing.
+func (ms *MintServer) mintQuoteBatchCheck(rw http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	if vars["method"] != cashu.BOLT11_METHOD {
+		ms.writeErr(rw, req, cashu.PaymentMethodNotSupportedErr)
+		return
+	}
+
+	var batchReq struct {
+		Quotes []string `json:"quotes"`
+	}
+	if err := decodeJsonReqBody(req, &batchReq); err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	quotes, err := ms.mint.CheckMintQuotesBatch(batchReq.Quotes)
+	if err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	responses := make([]nut04.PostMintQuoteBolt11Response, len(quotes))
+	for i, quote := range quotes {
+		responses[i] = nut04.PostMintQuoteBolt11Response{
+			Quote:        quote.Id,
+			Request:      quote.PaymentRequest,
+			Amount:       quote.Amount,
+			Unit:         cashu.Sat.String(),
+			State:        quote.State,
+			Expiry:       quote.Expiry,
+			AmountPaid:   amountPaidFromState(quote),
+			AmountIssued: amountIssuedFromState(quote),
+			UpdatedAt:    uint64(time.Now().Unix()),
+		}
+		if quote.Pubkey != nil {
+			responses[i].Pubkey = hex.EncodeToString(quote.Pubkey.SerializeCompressed())
+		}
+	}
+
+	jsonRes, err := json.Marshal(&responses)
+	if err != nil {
+		ms.writeErr(rw, req, cashu.StandardErr)
+		return
+	}
+	ms.logRequest(req, http.StatusOK, "returning batch check for %d quotes", len(quotes))
+	rw.Write(jsonRes)
+}
+
+// mintTokensBatchRequest handles NUT-29 POST /v1/mint/{method}/batch: an
+// atomic consolidated mint across multiple paid quotes.
+func (ms *MintServer) mintTokensBatchRequest(rw http.ResponseWriter, req *http.Request) {
+	vars := mux.Vars(req)
+	if vars["method"] != cashu.BOLT11_METHOD {
+		ms.writeErr(rw, req, cashu.PaymentMethodNotSupportedErr)
+		return
+	}
+
+	var batchReq struct {
+		Quotes     []string              `json:"quotes"`
+		Outputs    cashu.BlindedMessages `json:"outputs"`
+		Signatures []string              `json:"signatures"`
+		_          struct {
+			QuoteAmounts []uint64 `json:"quote_amounts"`
+		} `json:"-"`
+	}
+	if err := decodeJsonReqBody(req, &batchReq); err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	blindedSignatures, err := ms.mint.MintTokensBatch(batchReq.Quotes, batchReq.Outputs, batchReq.Signatures)
+	if err != nil {
+		ms.writeErr(rw, req, err)
+		return
+	}
+
+	signatures := nut04.PostMintBolt11Response{Signatures: blindedSignatures}
+	jsonRes, err := json.Marshal(&signatures)
+	if err != nil {
+		ms.writeErr(rw, req, cashu.StandardErr)
+		return
+	}
+	ms.logRequest(req, http.StatusOK, "returning signatures for batch mint of %d quotes", len(batchReq.Quotes))
+	rw.Write(jsonRes)
 }

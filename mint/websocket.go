@@ -259,7 +259,7 @@ func (c *Client) subscriptionRequest(req nut17.WsRequest) (*nut17.WsResponse, *n
 					State:        quote.State,
 					Expiry:       quote.Expiry,
 					AmountPaid:   amountPaidFromState(quote),
-					AmountIssued: 0,
+					AmountIssued: amountIssuedFromState(quote),
 					UpdatedAt:    uint64(time.Now().Unix()),
 				}
 				jsonPayload, _ := json.Marshal(&firstQuoteState)
@@ -473,7 +473,7 @@ func (subClient *MintQuotesSubClient) Read() <-chan nut17.WsNotification {
 							State:        mintQuote.State,
 							Expiry:       mintQuote.Expiry,
 							AmountPaid:   amountPaidFromState(mintQuote),
-							AmountIssued: 0,
+							AmountIssued: amountIssuedFromState(mintQuote),
 							UpdatedAt:    uint64(time.Now().Unix()),
 						}
 						notificationPayload, _ := json.Marshal(&newQuoteState)

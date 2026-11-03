@@ -3,13 +3,12 @@
 package cashu
 
 import (
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"math"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -524,6 +523,10 @@ const (
 	MeltQuoteAlreadyPaidErrCode CashuErrCode = 20006
 
 	MeltQuoteErrCode CashuErrCode = 20009
+	// NUT-04: quote amounts MUST be positive integers.
+	MintQuoteZeroAmountErrCode CashuErrCode = 20010
+	// NUT-29: duplicate quote ids in a batch (nuts/29.md validation rule 2).
+	DuplicateQuotesErrCode CashuErrCode = 11016
 )
 
 var (
@@ -539,6 +542,8 @@ var (
 	MintQuoteAlreadyIssued       = Error{Detail: "quote already issued", Code: MintQuoteAlreadyIssuedErrCode}
 	MintingDisabled              = Error{Detail: "minting is disabled", Code: MintingDisabledErrCode}
 	MintAmountExceededErr        = Error{Detail: "max amount for minting exceeded", Code: AmountLimitExceeded}
+	MintQuoteZeroAmountErr       = Error{Detail: "quote amount must be a positive integer", Code: MintQuoteZeroAmountErrCode}
+	DuplicateQuotesErr           = Error{Detail: "duplicate quote ids in batch", Code: DuplicateQuotesErrCode}
 	MintQuoteInvalidSigErr       = Error{Detail: "Mint quote with pubkey but no valid signature provided.", Code: MintQuoteInvalidSigErrCode}
 	OutputsOverQuoteAmountErr    = Error{Detail: "sum of the output amounts is greater than quote amount", Code: StandardErrCode}
 	ProofAlreadyUsedErr          = Error{Detail: "proof already used", Code: ProofAlreadyUsedErrCode}
@@ -604,13 +609,13 @@ func CheckDuplicateBlindedMessages(bms BlindedMessages) bool {
 }
 
 func GenerateRandomQuoteId() (string, error) {
-	randomBytes := make([]byte, 32)
-	_, err := rand.Read(randomBytes)
+	// NUT-04/NUT-05: quote ids are UUID v7 (time-ordered, string form).
+	// Was a 64-hex random hash before the #59 P2 hygiene alignment.
+	id, err := uuid.NewV7()
 	if err != nil {
 		return "", err
 	}
-	hash := sha256.Sum256(randomBytes)
-	return hex.EncodeToString(hash[:]), nil
+	return id.String(), nil
 }
 
 func Max(x, y uint64) uint64 {

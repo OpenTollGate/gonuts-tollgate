@@ -759,11 +759,13 @@ func (w *Wallet) Receive(token cashu.Token, swapToTrusted bool) (uint64, error) 
 			return 0, fmt.Errorf("could not create swap request: %w", err)
 		}
 
-		//if P2PK locked ecash has `SIG_ALL` flag, sign outputs
+		//if P2PK locked ecash has `SIG_ALL` flag, sign the first-input
+		// aggregate witness per NUT-11 (tollgate #809: per-output
+		// signatures were a non-spec construction no other mint accepts)
 		if nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
-			req.outputs, err = nut11.AddSignatureToOutputs(req.outputs, w.privateKey)
+			req.inputs, err = nut11.AddSigAllSignatureToFirstInput(req.inputs, req.outputs, "", w.privateKey)
 			if err != nil {
-				return 0, fmt.Errorf("error signing outputs: %w", err)
+				return 0, fmt.Errorf("error signing SIG_ALL inputs: %w", err)
 			}
 		}
 
@@ -836,11 +838,13 @@ func (w *Wallet) ReceiveHTLC(token cashu.Token, preimage string) (uint64, error)
 			return 0, fmt.Errorf("could not create swap request: %w", err)
 		}
 
-		//if `SIG_ALL` flag, sign outputs
+		//if `SIG_ALL` flag, sign the first-input aggregate witness per
+		//NUT-11 (tollgate #809: per-output HTLC signing was a non-spec
+		//construction no other mint accepts)
 		if nut11.IsSigAll(nut10Secret) {
-			req.outputs, err = nut14.AddWitnessHTLCToOutputs(req.outputs, preimage, w.privateKey)
+			req.inputs, err = nut14.AddSigAllHTLCToFirstInput(req.inputs, req.outputs, "", preimage, w.privateKey)
 			if err != nil {
-				return 0, fmt.Errorf("could not add HTLC witness to outputs: %w", err)
+				return 0, fmt.Errorf("could not add SIG_ALL HTLC witness to first input: %w", err)
 			}
 		}
 
@@ -1040,9 +1044,9 @@ func (w *Wallet) swapWithRetry(
 				return nil, "", fmt.Errorf("could not create retry swap request: %w", createErr)
 			}
 			if nut10Secret.Kind == nut10.P2PK && nut11.IsSigAll(nut10Secret) {
-				retryReq.outputs, err = nut11.AddSignatureToOutputs(retryReq.outputs, w.privateKey)
+				retryReq.inputs, err = nut11.AddSigAllSignatureToFirstInput(retryReq.inputs, retryReq.outputs, "", w.privateKey)
 				if err != nil {
-					return nil, "", fmt.Errorf("error signing outputs on retry: %w", err)
+					return nil, "", fmt.Errorf("error signing SIG_ALL inputs on retry: %w", err)
 				}
 			}
 			newProofs, retryOpID, err := w.swapWithIntent(mintURL, retryReq)
@@ -1067,9 +1071,9 @@ func (w *Wallet) swapToTrusted(proofs cashu.Proofs, mint *walletMint) (uint64, e
 		if err != nil {
 			return 0, fmt.Errorf("could not create swap request: %w", err)
 		}
-		req.outputs, err = nut11.AddSignatureToOutputs(req.outputs, w.privateKey)
+		req.inputs, err = nut11.AddSigAllSignatureToFirstInput(req.inputs, req.outputs, "", w.privateKey)
 		if err != nil {
-			return 0, fmt.Errorf("error signing outputs: %w", err)
+			return 0, fmt.Errorf("error signing SIG_ALL inputs: %w", err)
 		}
 
 		newProofs, err := swap(mint.mintURL, req)

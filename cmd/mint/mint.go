@@ -196,7 +196,26 @@ func configFromEnv() (*mint.Config, error) {
 		}
 
 	case "FAKEBACKEND":
-		lightningClient = &lightning.FakeBackend{}
+		fakeBackend := &lightning.FakeBackend{}
+		// MINT_FAKE_PAYMENT_DELAY (seconds): payments report PENDING until
+		// the delay elapses, then settle on status lookups — drives the
+		// kill/restart crash-boundary harness (test-only knob).
+		if delayEnv, ok := os.LookupEnv("MINT_FAKE_PAYMENT_DELAY"); ok {
+			delay, err := strconv.ParseInt(delayEnv, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid MINT_FAKE_PAYMENT_DELAY: %v", err)
+			}
+			fakeBackend.PaymentDelay = delay
+		}
+		// MINT_FAKE_BACKEND_STATE: durable outgoing-payment file — models
+		// the backend as a process independent of the mint (kill/restart
+		// harness; payments survive the mint's death).
+		if statePath, ok := os.LookupEnv("MINT_FAKE_BACKEND_STATE"); ok {
+			if err := fakeBackend.LoadState(statePath); err != nil {
+				return nil, fmt.Errorf("invalid MINT_FAKE_BACKEND_STATE: %v", err)
+			}
+		}
+		lightningClient = fakeBackend
 
 	default:
 		return nil, errors.New("invalid lightning backend")

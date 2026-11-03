@@ -53,10 +53,18 @@ func (m *Mint) checkInvoicePaid(ctx context.Context, quoteId string) {
 	case invoice := <-updateChan:
 		if invoice.Settled {
 			m.logInfof("received update from invoice sub. Invoice for mint quote '%v' is PAID", mintQuote.Id)
-			mintQuote.State = nut04.Paid
-			if err := m.db.UpdateMintQuoteState(mintQuote.Id, mintQuote.State); err != nil {
+			// Unpaid->Paid ONLY (conditional). An unconditional write here
+			// can resurrect Paid over Pending/Issued — a concurrent minter
+			// that already claimed the quote would race a second claim and
+			// double-issue (caught by the deterministic double-issuance
+			// regression test).
+			claimed, err := m.db.UpdateMintQuoteStateCAS(mintQuote.Id, nut04.Unpaid, nut04.Paid)
+			if err != nil {
 				m.logErrorf("could not mark mint quote '%v' as PAID in db: %v", mintQuote.Id, err)
+			} else if !claimed {
+				m.logDebugf("mint quote '%v' already left UNPAID (claimed or issued) — not overwriting", mintQuote.Id)
 			}
+			mintQuote.State = nut04.Paid
 			jsonQuote, _ := json.Marshal(mintQuote)
 			m.publisher.Publish(BOLT11_MINT_QUOTE_TOPIC, jsonQuote)
 		}

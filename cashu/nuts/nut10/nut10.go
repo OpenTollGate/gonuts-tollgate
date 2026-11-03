@@ -36,11 +36,11 @@ type WellKnownSecret struct {
 
 type SecretData struct {
 	// NUT #10: `nonce` is a unique random string
-	Nonce string     `json:"nonce"`
+	Nonce string `json:"nonce"`
 	// NUT #10: `data` expresses the spending condition specific to each kind
-	Data  string     `json:"data"`
+	Data string `json:"data"`
 	// NUT #10: `tags` hold additional data committed to and can be used for feature extensions
-	Tags  [][]string `json:"tags"`
+	Tags [][]string `json:"tags"`
 }
 
 // SerializeSecret returns the json string to be put in the secret field of a proof

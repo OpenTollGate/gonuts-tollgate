@@ -214,6 +214,61 @@ func (sqlite *SQLiteDB) SaveProofs(proofs cashu.Proofs) error {
 	return nil
 }
 
+// SettleProofs atomically moves proofs from pending to used: the
+// pending-proofs DELETE and the spent-proofs INSERT run in ONE
+// transaction. The previous two-statement form left a window between
+// "removed from pending" and "recorded as used" in which a concurrent
+// melt's AddPendingProofs could re-claim the same Ys and pay again —
+// the same-proofs/two-quotes double-spend (caught in-process by the
+// melt CAS regression tests; the wire rig's timing never hit it).
+func (sqlite *SQLiteDB) SettleProofs(Ys []string, proofs cashu.Proofs) error {
+	tx, err := sqlite.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	stmtDel, err := tx.Prepare("DELETE FROM pending_proofs WHERE y = ?")
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmtDel.Close()
+
+	for _, y := range Ys {
+		if _, err := stmtDel.Exec(y); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	stmtIns, err := tx.Prepare("INSERT INTO proofs (y, amount, keyset_id, secret, c, witness) VALUES (?, ?, ?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmtIns.Close()
+
+	for _, proof := range proofs {
+		Y, err := crypto.HashToCurve([]byte(proof.Secret))
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		Yhex := hex.EncodeToString(Y.SerializeCompressed())
+
+		if _, err := stmtIns.Exec(Yhex, proof.Amount, proof.Id, proof.Secret, proof.C, proof.Witness); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (sqlite *SQLiteDB) GetProofsUsed(Ys []string) ([]storage.DBProof, error) {
 	proofs := []storage.DBProof{}
 	query := `SELECT * FROM proofs WHERE y in (?` + strings.Repeat(",?", len(Ys)-1) + `)`
@@ -269,9 +324,25 @@ func (sqlite *SQLiteDB) AddPendingProofs(proofs cashu.Proofs, quoteId string) er
 	for _, proof := range proofs {
 		Y, err := crypto.HashToCurve([]byte(proof.Secret))
 		if err != nil {
+			tx.Rollback()
 			return err
 		}
 		Yhex := hex.EncodeToString(Y.SerializeCompressed())
+
+		// Guard inside the SAME transaction as the insert: if the proof
+		// is already recorded as used (spent by a concurrent melt that
+		// settled while this request was in flight), the insert must
+		// fail HERE — otherwise this melt pays with already-spent proofs
+		// (the post-settle half of the same-proofs/two-quotes race).
+		var used int
+		if err := tx.QueryRow("SELECT COUNT(*) FROM proofs WHERE y = ?", Yhex).Scan(&used); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if used > 0 {
+			tx.Rollback()
+			return cashu.ProofAlreadyUsedErr
+		}
 
 		if _, err := stmt.Exec(Yhex, proof.Amount, proof.Id, proof.Secret, proof.C, proof.Witness, quoteId); err != nil {
 			tx.Rollback()
@@ -504,6 +575,26 @@ func (sqlite *SQLiteDB) UpdateMintQuoteState(quoteId string, state nut04.State) 
 		return errors.New("mint quote was not updated")
 	}
 	return nil
+}
+
+// UpdateMintQuoteStateCAS atomically claims a mint-quote state transition:
+// the UPDATE's WHERE carries the expected prior state, so exactly one
+// concurrent caller flips the row. Guards MintTokens against concurrent
+// double issuance on one paid quote (the mint-side sibling of the melt
+// quote CAS — cashu-audit #59).
+func (sqlite *SQLiteDB) UpdateMintQuoteStateCAS(quoteId string, from nut04.State, to nut04.State) (bool, error) {
+	result, err := sqlite.db.Exec(
+		"UPDATE mint_quotes SET state = ? WHERE id = ? AND state = ?",
+		to.String(), quoteId, from.String(),
+	)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return count == 1, nil
 }
 
 func (sqlite *SQLiteDB) SaveMeltQuote(meltQuote storage.MeltQuote) error {
