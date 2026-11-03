@@ -11,27 +11,43 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/fxamacker/cbor/v2"
 )
 
-type Unit int
+// Unit is the denomination of a Cashu keyset. It is a string, not an enum,
+// because the set of units is open: a community mint may issue `mb` for
+// metered access, `min` for time, or any other unit an operator prices. An
+// enum with only Sat here made every such mint unreachable — the wallet could
+// not name the unit it wanted, and token construction refused anything that
+// was not sat.
+//
+// The zero value is the empty string, which callers should treat as "unset";
+// use NormalizeUnit to map it to sat.
+type Unit string
 
 const (
-	Sat Unit = iota
+	Sat Unit = "sat"
 
 	BOLT11_METHOD     = "bolt11"
 	MAX_SECRET_LENGTH = 512
 )
 
 func (unit Unit) String() string {
-	switch unit {
-	case Sat:
-		return "sat"
-	default:
-		return "unknown"
+	return string(unit)
+}
+
+// NormalizeUnit returns the canonical spelling of a unit: lowercase, trimmed,
+// with the empty string meaning sat. Cashu units are lowercase on the wire, and
+// a config that says "MB" means the same thing as "mb".
+func NormalizeUnit(unit string) Unit {
+	u := strings.ToLower(strings.TrimSpace(unit))
+	if u == "" {
+		return Sat
 	}
+	return Unit(u)
 }
 
 var (
@@ -203,8 +219,12 @@ func NewTokenV3(proofs Proofs, mint string, unit Unit, includeDLEQ bool) (TokenV
 		}
 	}
 
-	if unit != Sat {
-		return TokenV3{}, ErrInvalidUnit
+	// Any non-empty unit is legitimate: the keyset that signed these proofs is
+	// the authority on what they are denominated in, and an operator mint may
+	// issue a unit this package has never heard of (`mb`, `min`). Refusing
+	// anything but sat here is what made custom-unit tokens unconstructable.
+	if unit == "" {
+		unit = Sat
 	}
 
 	tokenProof := TokenV3Proof{Mint: mint, Proofs: proofs}
@@ -335,8 +355,8 @@ func (d *DLEQV4) MarshalJSON() ([]byte, error) {
 }
 
 func NewTokenV4(proofs Proofs, mint string, unit Unit, includeDLEQ bool) (TokenV4, error) {
-	if unit != Sat {
-		return TokenV4{}, ErrInvalidUnit
+	if unit == "" {
+		unit = Sat
 	}
 
 	proofsMap := make(map[string][]ProofV4)
