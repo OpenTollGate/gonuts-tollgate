@@ -40,6 +40,12 @@ type MintDB interface {
 	// variant of the cashu-cf #41 TOCTOU).
 	UpdateMeltQuoteStateCAS(quoteId string, from nut05.State, to nut05.State) (bool, error)
 
+	// SettleProofs atomically moves proofs from pending to used in ONE
+	// transaction (delete-pending + insert-used). The two-statement form
+	// left a re-claim window between the statements — the same-proofs
+	// double-spend race (cashu-audit #59, melt CAS regression tests).
+	SettleProofs(Ys []string, proofs cashu.Proofs) error
+
 	SaveBlindSignatures(B_s []string, blindSignatures cashu.BlindedSignatures) error
 	GetBlindSignature(B_ string) (cashu.BlindedSignature, error)
 	GetBlindSignatures(B_s []string) (cashu.BlindedSignatures, error)
