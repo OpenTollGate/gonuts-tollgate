@@ -1264,6 +1264,54 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		return nil, fmt.Errorf("error generating blinded messages for change: %w", err)
 	}
 
+	// NUT-11 spending conditions on the melt inputs: the wallet must
+	// produce the witness the mint verifies in MeltTokens — for SIG_ALL
+	// locks, the first-input aggregate over inputs + NUT-08 blank
+	// outputs + quote id (cashu-audit #68 B1: the mint has accepted
+	// spec SIG_ALL melts since the #809 alignment, but the wallet never
+	// produced the witness, so melting SIG_ALL-locked tokens was
+	// impossible end-to-end). The witness is computed over the exact
+	// (inputs, outputs, quote id) that go on the wire AND into the melt
+	// intent below, so a crash-recovery replay re-POSTs byte-identical
+	// bytes — the #497 replay invariant.
+	if nut10Secret, secretErr := nut10.DeserializeSecret(proofs[0].Secret); secretErr == nil {
+		switch nut10Secret.Kind {
+		case nut10.P2PK:
+			// the wallet can only melt locks it holds a signing key for
+			if !nut11.CanSign(nut10Secret, w.privateKey) {
+				if relErr := w.releaseMeltProofs(proofs, quote.QuoteId); relErr != nil {
+					return nil, relErr
+				}
+				return nil, errors.New("cannot sign locked proofs")
+			}
+			proofs, err = nut11.AddSignatureToInputs(proofs, w.privateKey)
+			if err != nil {
+				if relErr := w.releaseMeltProofs(proofs, quote.QuoteId); relErr != nil {
+					return nil, relErr
+				}
+				return nil, fmt.Errorf("error signing melt inputs: %w", err)
+			}
+			if nut11.IsSigAll(nut10Secret) {
+				// SIG_ALL binds the aggregate: inputs + blank outputs + quote id
+				proofs, err = nut11.AddSigAllSignatureToFirstInput(proofs, outputs, quote.QuoteId, w.privateKey)
+				if err != nil {
+					if relErr := w.releaseMeltProofs(proofs, quote.QuoteId); relErr != nil {
+						return nil, relErr
+					}
+					return nil, fmt.Errorf("error signing SIG_ALL melt inputs: %w", err)
+				}
+			}
+		case nut10.HTLC:
+			// HTLC-locked melts need the preimage; Melt carries none, so
+			// refuse locally instead of firing a request the mint must
+			// reject (which would strand the inputs as pending).
+			if relErr := w.releaseMeltProofs(proofs, quote.QuoteId); relErr != nil {
+				return nil, relErr
+			}
+			return nil, errors.New("cannot melt HTLC-locked proofs without a preimage")
+		}
+	}
+
 	// The blank outputs are exposed to the mint with this request, so their
 	// derivation range must be persisted BEFORE it is sent (the same
 	// reserve-before-expose invariant as Receive, #266). If the mint pays the
@@ -1361,6 +1409,20 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		}
 	}
 	return meltBolt11Response, err
+}
+
+// releaseMeltProofs returns proofs that were marked pending for a melt
+// that will not fire back to the spendable pool — the rollback of the
+// AddPendingProofsByQuoteId step (same sequence as the unpaid/payment-
+// failed paths), reused by the spending-condition refusals in Melt.
+func (w *Wallet) releaseMeltProofs(proofs cashu.Proofs, quoteId string) error {
+	if err := w.db.SaveProofs(proofs); err != nil {
+		return fmt.Errorf("error storing proofs: %w", err)
+	}
+	if err := w.db.DeletePendingProofsByQuoteId(quoteId); err != nil {
+		return fmt.Errorf("error removing pending proofs: %w", err)
+	}
+	return nil
 }
 
 // MultiMintPayment tries an MPP according to NUT-15. The split is a map where the

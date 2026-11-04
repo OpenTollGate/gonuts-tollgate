@@ -54,6 +54,22 @@ type signingMint struct {
 	restoreCalls    int
 	restoreErr      bool
 	dropLastRestore bool
+	// meltAmount/meltFeeReserve shape the melt quote the stub returns
+	// (defaults 21/1). Tests that need an exact selection (e.g. locked
+	// inputs) set these so amount+reserve equals the stored balance.
+	meltAmount     uint64
+	meltFeeReserve uint64
+}
+
+func (m *signingMint) meltQuoteShape() (uint64, uint64) {
+	amount, fee := m.meltAmount, m.meltFeeReserve
+	if amount == 0 {
+		amount = 21
+	}
+	if fee == 0 {
+		fee = 1
+	}
+	return amount, fee
 }
 
 func newSigningMint(t *testing.T) *signingMint {
@@ -131,19 +147,20 @@ func newSigningMint(t *testing.T) *signingMint {
 		_ = json.NewEncoder(w).Encode(nut04.PostMintBolt11Response{Signatures: cashu.BlindedSignatures(sigs)})
 	})
 	mux.HandleFunc("/v1/melt/quote/bolt11/", func(w http.ResponseWriter, r *http.Request) {
+		amount, fee := m.meltQuoteShape()
 		if r.Method == http.MethodGet {
 			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 			id := parts[len(parts)-1]
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"quote": id, "request": fakeMeltInvoice, "amount": 21, "unit": "sat",
-				"fee_reserve": 1, "state": "UNPAID", "expiry": 0, "updated_at": 0,
+				"quote": id, "request": fakeMeltInvoice, "amount": amount, "unit": "sat",
+				"fee_reserve": fee, "state": "UNPAID", "expiry": 0, "updated_at": 0,
 			})
 			return
 		}
 		id := fmt.Sprintf("meltquote-%d", time.Now().UnixNano())
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"quote": id, "request": fakeMeltInvoice, "amount": 21, "unit": "sat",
-			"fee_reserve": 1, "state": "UNPAID", "expiry": 0, "updated_at": 0,
+			"quote": id, "request": fakeMeltInvoice, "amount": amount, "unit": "sat",
+			"fee_reserve": fee, "state": "UNPAID", "expiry": 0, "updated_at": 0,
 		})
 	})
 	mux.HandleFunc("/v1/melt/bolt11", func(w http.ResponseWriter, r *http.Request) {
