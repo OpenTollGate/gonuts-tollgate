@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Wallet-side SIG_ALL melt production (cashu-audit #68 B1): `Melt` now
+  produces the NUT-11 witness for spending-condition inputs — for
+  SIG_ALL locks, the first-input aggregate over inputs + NUT-08 blank
+  outputs + quote id; for plain P2PK locks, per-input signatures. The
+  mint has accepted spec SIG_ALL melts since the #809 alignment, but
+  the wallet never produced the witness, so melting locked tokens was
+  impossible end-to-end. The witness is computed over the exact bytes
+  that go on the wire and into the melt intent (crash-recovery replays
+  stay byte-identical). Proofs locked to keys the wallet does not hold,
+  and HTLC-locked proofs (no preimage in the melt path), are refused
+  locally with the inputs released instead of firing a request the mint
+  must reject.
 - Melt-quote double-settlement: atomic UNPAID→PENDING CAS before payment
   (two concurrent melts on one quote both paid); failure paths roll the
   claim back so quotes stay retryable (cashu-audit #59 P0).
