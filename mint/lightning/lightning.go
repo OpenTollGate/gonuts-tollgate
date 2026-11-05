@@ -48,6 +48,14 @@ type PaymentStatus struct {
 	Preimage             string
 	PaymentStatus        State
 	PaymentFailureReason string
+	// FeeSpent is the fee the backend actually charged for the payment,
+	// beyond the invoice amount (NUT-08: the source of truth for melt
+	// change). FeeSpentKnown distinguishes "the backend reports the fee
+	// and it is FeeSpent" from "this backend cannot report fees" — the
+	// melt path treats unknown as the full fee reserve consumed (never
+	// returns change it cannot account for; fund-safe for the operator).
+	FeeSpent     uint64
+	FeeSpentKnown bool
 }
 
 // InvoiceSubscriptionClient subscribes to get updates on the status of an invoice

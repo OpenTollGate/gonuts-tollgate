@@ -1054,6 +1054,16 @@ func (m *Mint) GetMeltQuoteState(ctx context.Context, quoteId string) (storage.M
 				errmsg := fmt.Sprintf("error loading pending proofs for quote: %v", err)
 				return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
+			// sign + persist the NUT-08 change BEFORE the settle/Paid
+			// writes (persist-sigs-before-Paid). On signing failure the
+			// quote stays PENDING with proofs pending — nothing is
+			// rolled back (the payment stands) and the next poll
+			// retries; the journaled blank outputs make the change
+			// computable without the original request.
+			if _, err := m.signMeltChange(meltQuote, proofs, proofs.Amount(), uint64(m.TransactionFees(proofs)), paymentStatus); err != nil {
+				m.logErrorf("melt quote '%v': change signing failed during poll reconciliation: %v (quote stays PENDING)", meltQuote.Id, err)
+				return storage.MeltQuote{}, cashu.BuildCashuError(fmt.Sprintf("error signing melt change: %v", err), cashu.DBErrCode)
+			}
 			err = m.db.SettleProofs(Ys, proofs)
 			if err != nil {
 				errmsg := fmt.Sprintf("error settling proofs for quote (pending->used must be atomic): %v", err)
@@ -1143,8 +1153,11 @@ func (m *Mint) pendingProofsForQuote(quoteId string) (cashu.Proofs, []string, er
 }
 
 // MeltTokens verifies whether proofs provided are valid
-// and proceeds to attempt payment.
-func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltBolt11Request) (storage.MeltQuote, error) {
+// and proceeds to attempt payment. On a PAID melt it also signs the
+// NUT-08 change for the request's blank outputs (the overpaid fee
+// reserve and any over-funding), persisting the signatures before the
+// quote's Paid write so every crash point leaves them recoverable.
+func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltBolt11Request) (storage.MeltQuote, cashu.BlindedSignatures, error) {
 	// NUT #05: `inputs` are the proofs with a total amount sufficient to cover the requested amount plus any fees
 	proofs := meltTokensRequest.Inputs
 
@@ -1155,7 +1168,7 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 
 		Y, err := crypto.HashToCurve([]byte(proof.Secret))
 		if err != nil {
-			return storage.MeltQuote{}, cashu.InvalidProofErr
+			return storage.MeltQuote{}, nil, cashu.InvalidProofErr
 		}
 		Yhex := hex.EncodeToString(Y.SerializeCompressed())
 		Ys[i] = Yhex
@@ -1163,24 +1176,41 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 
 	meltQuote, err := m.db.GetMeltQuote(meltTokensRequest.Quote)
 	if err != nil {
-		return storage.MeltQuote{}, cashu.QuoteNotExistErr
+		return storage.MeltQuote{}, nil, cashu.QuoteNotExistErr
 	}
 	if meltQuote.State == nut05.Paid {
-		return storage.MeltQuote{}, cashu.MeltQuoteAlreadyPaid
+		// idempotent replay of a settled melt: identical blank outputs
+		// (the journaled set) answer with the stored change signatures —
+		// a wallet that lost the first response recovers byte-identical
+		// change even after the NUT-19 response cache is gone (the
+		// wallet-side #497 replay invariant, answered mint-side).
+		if requestMatchesStoredOutputs(meltTokensRequest.Outputs, meltQuote.Id, m.db) {
+			m.logInfof("replaying settled melt quote '%v': returning stored change", meltQuote.Id)
+			return meltQuote, m.MeltQuoteChange(meltQuote.Id), nil
+		}
+		return storage.MeltQuote{}, nil, cashu.MeltQuoteAlreadyPaid
 	}
 	if meltQuote.State == nut05.Pending {
-		return storage.MeltQuote{}, cashu.QuotePending
+		return storage.MeltQuote{}, nil, cashu.QuotePending
 	}
 
 	err = m.verifyProofs(proofs, Ys)
 	if err != nil {
-		return storage.MeltQuote{}, err
+		return storage.MeltQuote{}, nil, err
 	}
 
 	fees := m.TransactionFees(proofs)
 	// checks if amount in proofs is enough
 	if proofsAmount < meltQuote.Amount+meltQuote.FeeReserve+uint64(fees) {
-		return storage.MeltQuote{}, cashu.InsufficientProofsAmount
+		return storage.MeltQuote{}, nil, cashu.InsufficientProofsAmount
+	}
+
+	// NUT-08: blank outputs must be validated before the quote is
+	// claimed — after the payment there is no refusing a bad request
+	// shape anymore (fund-safety: local validation precedes the
+	// irreversible payment).
+	if err := m.validateMeltChangeOutputs(meltTokensRequest.Outputs); err != nil {
+		return storage.MeltQuote{}, nil, err
 	}
 
 	// NUT-11 SIG_ALL melts are spec-legal: the witness lives in the first
@@ -1190,7 +1220,7 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 	// irreversible state changes). tollgate #809 / cashu-audit #59 P1.
 	if nut11.ProofsSigAll(proofs) {
 		if err := m.verifySigAllGroup(proofs, meltTokensRequest.Outputs, meltQuote.Id); err != nil {
-			return storage.MeltQuote{}, err
+			return storage.MeltQuote{}, nil, err
 		}
 		m.logDebugf("verified SIG_ALL melt witness (aggregate + quote id)")
 	}
@@ -1204,10 +1234,10 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 	claimed, err := m.db.UpdateMeltQuoteStateCAS(meltQuote.Id, nut05.Unpaid, nut05.Pending)
 	if err != nil {
 		errmsg := fmt.Sprintf("error claiming melt quote state: %v", err)
-		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+		return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 	}
 	if !claimed {
-		return storage.MeltQuote{}, cashu.QuotePending
+		return storage.MeltQuote{}, nil, cashu.QuotePending
 	}
 	// mark in-flight for the poll-path reconciler; released on every exit
 	m.meltInFlight.Store(meltQuote.Id, struct{}{})
@@ -1233,7 +1263,30 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 			m.logErrorf("melt quote '%v' stranded PENDING after AddPendingProofs failure: %v (rollback error: %v)",
 				meltQuote.Id, err, rbErr)
 		}
-		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+		return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+	}
+
+	// journal the NUT-08 blank outputs BEFORE the payment attempt: once a
+	// payment can exist, its change destinations must be durable — the
+	// poll-path reconciler (and this retry path) signs the change from
+	// this journal, not from the request it no longer has.
+	if len(meltTokensRequest.Outputs) > 0 {
+		if err := m.db.SaveMeltChangeOutputs(meltQuote.Id, meltTokensRequest.Outputs); err != nil {
+			errmsg := fmt.Sprintf("error journaling melt change outputs: %v", err)
+			// same rollback discipline as AddPendingProofs above:
+			// release the claim and the pending proofs so the melt is
+			// retryable (nothing was paid yet)
+			if _, rbErr := m.db.UpdateMeltQuoteStateCAS(meltQuote.Id, nut05.Pending, nut05.Unpaid); rbErr != nil {
+				errmsg = fmt.Sprintf(
+					"%v (rollback failed: %v — quote '%v' remains PENDING, needs pending-quote recovery)",
+					errmsg, rbErr, meltQuote.Id,
+				)
+			}
+			if rmErr := m.db.RemovePendingProofs(Ys); rmErr != nil {
+				errmsg = fmt.Sprintf("%v (also could not remove pending proofs: %v)", errmsg, rmErr)
+			}
+			return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+		}
 	}
 
 	// before asking backend to send payment, check if quotes can be settled
@@ -1243,13 +1296,28 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 		m.logDebugf("quotes '%v' and '%v' have same invoice so settling them internally", meltQuote.Id, mintQuote.Id)
 		meltQuote, err = m.settleQuotesInternally(mintQuote, meltQuote)
 		if err != nil {
-			return storage.MeltQuote{}, err
+			return storage.MeltQuote{}, nil, err
+		}
+		// internal settlement pays no Lightning fee: the whole fee
+		// reserve (plus any over-funding) is overpaid and returns as
+		// change — signed and persisted BEFORE the settle/Paid writes.
+		var change cashu.BlindedSignatures
+		change, err = m.signMeltChange(meltQuote, proofs, proofsAmount, uint64(fees), lightning.PaymentStatus{
+			PaymentStatus: lightning.Succeeded, FeeSpentKnown: true,
+		})
+		if err != nil {
+			// the payment stands (settled internally); the quote stays
+			// PENDING with proofs pending so the poll-path reconciler
+			// retries the change signing and completes the state machine
+			m.logErrorf("melt quote '%v': change signing failed after internal settle: %v (leaving PENDING for reconciliation)", meltQuote.Id, err)
+			return storage.MeltQuote{}, nil, err
 		}
 		if err := m.db.SettleProofs(Ys, proofs); err != nil {
 			errmsg := fmt.Sprintf("error settling proofs (pending->used must be atomic): %v", err)
-			return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+			return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 		}
 		m.publishProofsStateChanges(proofs, nut07.Spent)
+		return meltQuote, change, nil
 	} else {
 		var sendPaymentResponse lightning.PaymentStatus
 		// if melt is MPP, pay partial amount. If not, send full payment
@@ -1276,24 +1344,38 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 		case lightning.Succeeded:
 			m.logInfof("succesfully paid invoice with hash '%v' for melt quote '%v'", meltQuote.PaymentHash, meltQuote.Id)
 			// if payment succeeded:
+			// - sign + persist the NUT-08 change BEFORE the settle/Paid
+			//   writes (persist-sigs-before-Paid, the #59 discipline: a
+			//   crash between signing and the Paid write replays from
+			//   the blind-signature store)
 			// - unset pending proofs and mark them as spent by adding them to the db
 			// - mark melt quote as paid
+			change, err := m.signMeltChange(meltQuote, proofs, proofsAmount, uint64(fees), sendPaymentResponse)
+			if err != nil {
+				// the payment already succeeded — do NOT roll anything
+				// back: return the error with the quote still PENDING
+				// (proofs pending) and let the poll-path reconciler
+				// retry the change signing and complete the settle.
+				m.logErrorf("melt quote '%v': change signing failed after successful payment: %v (leaving PENDING for reconciliation)", meltQuote.Id, err)
+				return storage.MeltQuote{}, nil, err
+			}
 			meltQuote.State = nut05.Paid
 			meltQuote.Preimage = sendPaymentResponse.Preimage
 			err = m.settleProofs(Ys, proofs)
 			if err != nil {
-				return storage.MeltQuote{}, err
+				return storage.MeltQuote{}, nil, err
 			}
 			err = m.db.UpdateMeltQuote(meltQuote.Id, sendPaymentResponse.Preimage, nut05.Paid)
 			if err != nil {
 				errmsg := fmt.Sprintf("error updating melt quote state: %v", err)
-				return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+				return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 			}
+			return meltQuote, change, nil
 
 		case lightning.Pending:
 			// if payment is pending, leave quote and proofs as pending and return
 			m.logInfof("outgoing payment for quote '%v' is pending.", meltQuote.Id)
-			return meltQuote, nil
+			return meltQuote, nil, nil
 
 		case lightning.Failed:
 			// if got failed from SendPayment
@@ -1307,18 +1389,18 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 				err = m.db.UpdateMeltQuote(meltQuote.Id, "", meltQuote.State)
 				if err != nil {
 					errmsg := fmt.Sprintf("error updating melt quote state: %v", err)
-					return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+					return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 				}
 				err = m.db.RemovePendingProofs(Ys)
 				if err != nil {
 					errmsg := fmt.Sprintf("error removing proofs from pending: %v", err)
-					return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+					return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 				}
-				return meltQuote, nil
+				return meltQuote, nil, nil
 			}
 			if err != nil {
 				m.logErrorf(`error checking outgoing payment status: %v. Leaving proofs for quote '%v' as pending`, err, meltQuote.Id)
-				return meltQuote, nil
+				return meltQuote, nil, nil
 			}
 
 			switch paymentStatus.PaymentStatus {
@@ -1333,32 +1415,38 @@ func (m *Mint) MeltTokens(ctx context.Context, meltTokensRequest nut05.PostMeltB
 				err = m.db.UpdateMeltQuote(meltQuote.Id, "", meltQuote.State)
 				if err != nil {
 					errmsg := fmt.Sprintf("error updating melt quote state: %v", err)
-					return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+					return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 				}
 				err = m.db.RemovePendingProofs(Ys)
 				if err != nil {
 					errmsg := fmt.Sprintf("error removing proofs from pending: %v", err)
-					return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+					return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 				}
-				return meltQuote, nil
+				return meltQuote, nil, nil
 			case lightning.Succeeded:
 				m.logInfof("succesfully paid invoice with hash '%v' for melt quote '%v'", meltQuote.PaymentHash, meltQuote.Id)
+				change, err := m.signMeltChange(meltQuote, proofs, proofsAmount, uint64(fees), paymentStatus)
+				if err != nil {
+					m.logErrorf("melt quote '%v': change signing failed after reconciled payment: %v (leaving PENDING for reconciliation)", meltQuote.Id, err)
+					return storage.MeltQuote{}, nil, err
+				}
 				err = m.settleProofs(Ys, proofs)
 				if err != nil {
-					return storage.MeltQuote{}, err
+					return storage.MeltQuote{}, nil, err
 				}
 				meltQuote.State = nut05.Paid
 				meltQuote.Preimage = paymentStatus.Preimage
 				err = m.db.UpdateMeltQuote(meltQuote.Id, paymentStatus.Preimage, nut05.Paid)
 				if err != nil {
 					errmsg := fmt.Sprintf("error updating melt quote state: %v", err)
-					return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
+					return storage.MeltQuote{}, nil, cashu.BuildCashuError(errmsg, cashu.DBErrCode)
 				}
+				return meltQuote, change, nil
 			}
 		}
 	}
 
-	return meltQuote, nil
+	return meltQuote, nil, nil
 }
 
 // if a pair of mint and melt quotes have the same invoice,
@@ -1754,6 +1842,219 @@ func (m *Mint) signBlindedMessages(blindedMessages cashu.BlindedMessages) (cashu
 	return blindedSignatures, nil
 }
 
+// validateMeltChangeOutputs validates a melt request's NUT-08 blank
+// outputs BEFORE the quote is claimed — everything signing needs later
+// is checked here, so no post-payment state change can fail on request
+// shape (fund-safety: local validation precedes irreversible operations).
+//
+// NUT-08: blank outputs MUST carry amount 0 (the mint imprints the change
+// amount itself); the keyset MUST be one the mint can sign — the active
+// keyset (signBlindedMessages refuses inactive ones); B_ values must be
+// parseable curve points and unique.
+func (m *Mint) validateMeltChangeOutputs(outputs cashu.BlindedMessages) error {
+	if len(outputs) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(outputs))
+	for _, output := range outputs {
+		if output.Amount != 0 {
+			return cashu.InvalidBlindedMessageAmount
+		}
+		if output.Id != m.activeKeyset.Id {
+			return cashu.InactiveKeysetSignatureRequest
+		}
+		B_bytes, err := hex.DecodeString(output.B_)
+		if err != nil {
+			return cashu.BuildCashuError(fmt.Sprintf("invalid B_: %v", err), cashu.StandardErrCode)
+		}
+		if _, err := btcec.ParsePubKey(B_bytes); err != nil {
+			return cashu.BuildCashuError(err.Error(), cashu.StandardErrCode)
+		}
+		if _, dup := seen[output.B_]; dup {
+			return cashu.DuplicateOutputs
+		}
+		seen[output.B_] = struct{}{}
+	}
+	return nil
+}
+
+// meltChangeTarget is the NUT-08 overpay the mint owes back as change:
+//
+//	change = inputs − input_fees − invoice_amount − fee_spent
+//
+// fee_spent is what the Lightning backend actually charged. Backends
+// that cannot report it (FeeSpentKnown=false) are charged the FULL fee
+// reserve: an unaccounted fee is never returned as change (operator
+// fund-safety) — only the over-funding beyond amount+reserve+fees is
+// returned for such backends. Saturating: a backend that overspent the
+// reserve yields no change, never a negative one.
+func meltChangeTarget(proofsAmount, inputFees uint64, quote storage.MeltQuote, payment lightning.PaymentStatus) uint64 {
+	feeSpent := quote.FeeReserve
+	if payment.FeeSpentKnown {
+		feeSpent = payment.FeeSpent
+	}
+	spent := quote.Amount + feeSpent
+	if proofsAmount <= inputFees+spent {
+		return 0
+	}
+	return proofsAmount - inputFees - spent
+}
+
+// splitChangeAmounts decomposes the change target into denominations the
+// active keyset can sign, largest first (binary decomposition for the
+// canonical 2^n keysets). A remainder no denomination covers (targets
+// exceeding the keyset's representable span) is returned as the
+// shortfall — it stays with the mint and must be logged by the caller.
+func (m *Mint) splitChangeAmounts(target uint64) (amounts []uint64, shortfall uint64) {
+	amounts = make([]uint64, 0, 8)
+	for target > 0 {
+		best := uint64(0)
+		for amount := range m.activeKeyset.Keys {
+			if amount > best && amount <= target {
+				best = amount
+			}
+		}
+		if best == 0 {
+			// no denomination fits the remainder (keyset floor > 1 or
+			// remainder below the smallest key): cannot be returned
+			return amounts, target
+		}
+		amounts = append(amounts, best)
+		target -= best
+	}
+	return amounts, 0
+}
+
+// signMeltChange signs and durably records the NUT-08 change for a quote
+// whose payment succeeded. Idempotent: if the signatures are already
+// persisted (a retry or a poll-path reconciliation after a crash between
+// signing and the Paid write), the stored set replays in output order —
+// the #59 discipline: persist signatures BEFORE the quote's Paid write,
+// so every crash point leaves the change recoverable.
+//
+// The blank outputs come from the journal (SaveMeltChangeOutputs at claim
+// time), never from this call's arguments — recovery paths (the poll
+// reconciler) no longer hold the original request.
+func (m *Mint) signMeltChange(
+	quote storage.MeltQuote,
+	proofs cashu.Proofs,
+	proofsAmount, inputFees uint64,
+	payment lightning.PaymentStatus,
+) (cashu.BlindedSignatures, error) {
+	outputs, err := m.db.GetMeltChangeOutputs(quote.Id)
+	if err != nil {
+		return nil, cashu.BuildCashuError(fmt.Sprintf("could not load journaled melt outputs: %v", err), cashu.DBErrCode)
+	}
+	if len(outputs) == 0 {
+		// no blank outputs sent: NUT-08 change is simply not claimed —
+		// the overpay stays with the mint (spec: change only if outputs
+		// were provided)
+		return nil, nil
+	}
+
+	// replay head: signatures already persisted (SaveBlindSignatures is
+	// one transaction, so the set is all-or-nothing)
+	stored := make(cashu.BlindedSignatures, 0, len(outputs))
+	for _, output := range outputs {
+		sig, err := m.db.GetBlindSignature(output.B_)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				stored = nil
+				break
+			}
+			return nil, cashu.BuildCashuError(fmt.Sprintf("could not load stored change signature: %v", err), cashu.DBErrCode)
+		}
+		stored = append(stored, sig)
+	}
+	if stored != nil {
+		m.logDebugf("replaying %d stored change signatures for melt quote '%v'", len(stored), quote.Id)
+		return stored, nil
+	}
+
+	target := meltChangeTarget(proofsAmount, inputFees, quote, payment)
+	if target == 0 {
+		return nil, nil
+	}
+	amounts, shortfall := m.splitChangeAmounts(target)
+	if len(amounts) > len(outputs) {
+		// more denominations than blank outputs: keep the LARGEST
+		// amounts (descending already) — the smallest remainder stays
+		// with the mint, mirroring the reference implementations
+		amounts = amounts[:len(outputs)]
+	}
+	if shortfall > 0 {
+		m.logInfof("melt quote '%v': %v sats of change exceed the keyset's representable denominations and stay with the mint", quote.Id, shortfall)
+	}
+	if len(amounts) == 0 {
+		return nil, nil
+	}
+
+	// imprint the change amounts onto the FIRST outputs in request order
+	// (NUT-08: signatures are returned in the blank outputs' order, value
+	// signatures only — zero-value ones omitted)
+	toSign := make(cashu.BlindedMessages, len(amounts))
+	for i, amount := range amounts {
+		toSign[i] = outputs[i]
+		toSign[i].Amount = amount
+	}
+
+	signatures, err := m.signBlindedMessages(toSign)
+	if err != nil {
+		return nil, err
+	}
+
+	B_s := make([]string, len(toSign))
+	for i, bm := range toSign {
+		B_s[i] = bm.B_
+	}
+	if err := m.db.SaveBlindSignatures(B_s, signatures); err != nil {
+		return nil, cashu.BuildCashuError(fmt.Sprintf("could not persist change signatures: %v", err), cashu.DBErrCode)
+	}
+	m.logInfof("melt quote '%v': returning %v sats NUT-08 change across %d outputs (fee_spent=%v known=%v)",
+		quote.Id, signatures.Amount(), len(signatures), payment.FeeSpent, payment.FeeSpentKnown)
+	return signatures, nil
+}
+
+// MeltQuoteChange returns the stored NUT-08 change signatures for a
+// quote in blank-output order — for the melt-quote state endpoint, so a
+// wallet that missed the melt response can still collect its change.
+func (m *Mint) MeltQuoteChange(quoteId string) cashu.BlindedSignatures {
+	outputs, err := m.db.GetMeltChangeOutputs(quoteId)
+	if err != nil || len(outputs) == 0 {
+		return nil
+	}
+	signatures := make(cashu.BlindedSignatures, 0, len(outputs))
+	for _, output := range outputs {
+		sig, err := m.db.GetBlindSignature(output.B_)
+		if err != nil {
+			return nil
+		}
+		signatures = append(signatures, sig)
+	}
+	return signatures
+}
+
+// requestMatchesStoredOutputs reports whether a re-POSTed melt request's
+// blank outputs are exactly the journaled set for the quote (same order)
+// — the identity check for replaying a PAID quote's change (the #497
+// byte-identity invariant, mint side: an identical re-POST is answered
+// idempotently even after the NUT-19 response cache is gone).
+func requestMatchesStoredOutputs(requestOutputs cashu.BlindedMessages, quoteId string, db storage.MintDB) bool {
+	if len(requestOutputs) == 0 {
+		return false
+	}
+	stored, err := db.GetMeltChangeOutputs(quoteId)
+	if err != nil || len(stored) != len(requestOutputs) {
+		return false
+	}
+	for i := range stored {
+		if stored[i].B_ != requestOutputs[i].B_ || stored[i].Id != requestOutputs[i].Id {
+			return false
+		}
+	}
+	return true
+}
+
 // requestInvoice requests an invoice from the Lightning backend for the given amount
 func (m *Mint) requestInvoice(amount uint64) (*lightning.Invoice, error) {
 	invoice, err := m.lightningClient.CreateInvoice(amount)
@@ -1922,7 +2223,9 @@ func (m *Mint) SetMintInfo(mintInfo MintInfo) {
 			Disabled: false,
 		},
 		Nut07: nut06.Supported{Supported: true},
-		Nut08: nut06.Supported{Supported: false},
+		// NUT-08: the mint returns overpaid fee reserve as change
+		// signatures for the melt request's blank outputs
+		Nut08: nut06.Supported{Supported: true},
 		Nut09: nut06.Supported{Supported: true},
 		Nut10: nut06.Supported{Supported: true},
 		Nut11: nut06.Supported{Supported: true},

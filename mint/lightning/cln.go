@@ -10,6 +10,8 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -201,6 +203,8 @@ func (cln *CLNClient) SendPayment(ctx context.Context, request string, maxFee ui
 	var response struct {
 		Preimage string `json:"payment_preimage"`
 		Status   string `json:"status"`
+		AmountMsat    json.Number `json:"amount_msat"`
+		AmountSentMsat json.Number `json:"amount_sent_msat"`
 	}
 	if err := json.Unmarshal(bodyBytes, &response); err != nil {
 		return PaymentStatus{PaymentStatus: Pending}, err
@@ -216,10 +220,45 @@ func (cln *CLNClient) SendPayment(ctx context.Context, request string, maxFee ui
 		status = Failed
 	}
 
-	return PaymentStatus{
+	paymentStatus := PaymentStatus{
 		Preimage:      response.Preimage,
 		PaymentStatus: status,
-	}, nil
+	}
+	// NUT-08: report the fee the payment actually spent so the melt path
+	// can return the unused reserve as change. Only claimed on `complete`
+	// — earlier states carry no final fee.
+	if status == Succeeded {
+		paymentStatus.FeeSpent, paymentStatus.FeeSpentKnown = clnFeeSpent(response.AmountMsat, response.AmountSentMsat)
+	}
+	return paymentStatus, nil
+}
+
+// clnFeeSpent derives the fee actually charged from a pay response's
+// amount_msat/amount_sent_msat pair (both are REQUIRED to be present for
+// a complete payment; a missing half reports unknown — the melt path then
+// keeps the reserve rather than guessing). CLN sends msat integers as
+// JSON numbers; tolerate string spellings defensively.
+func clnFeeSpent(amount, amountSent json.Number) (uint64, bool) {
+	if amount.String() == "" || amountSent.String() == "" {
+		return 0, false
+	}
+	amountMsat, err := parseMsat(amount)
+	if err != nil {
+		return 0, false
+	}
+	sentMsat, err := parseMsat(amountSent)
+	if err != nil || sentMsat < amountMsat {
+		return 0, false
+	}
+	feeMsat := sentMsat - amountMsat
+	// round the msat fee up to whole sats (the quote currency): never
+	// under-report what was spent
+	return (feeMsat + 999) / 1000, true
+}
+
+func parseMsat(n json.Number) (uint64, error) {
+	s := strings.TrimSuffix(n.String(), "msat")
+	return strconv.ParseUint(s, 10, 64)
 }
 
 func (cln *CLNClient) PayPartialAmount(
@@ -257,6 +296,8 @@ func (cln *CLNClient) PayPartialAmount(
 	var response struct {
 		Preimage string `json:"payment_preimage"`
 		Status   string `json:"status"`
+		AmountMsat     json.Number `json:"amount_msat"`
+		AmountSentMsat json.Number `json:"amount_sent_msat"`
 	}
 	if err := json.Unmarshal(bodyBytes, &response); err != nil {
 		return PaymentStatus{}, fmt.Errorf("failed to parse response: %w", err)
@@ -272,10 +313,14 @@ func (cln *CLNClient) PayPartialAmount(
 		status = Failed
 	}
 
-	return PaymentStatus{
+	paymentStatus := PaymentStatus{
 		Preimage:      response.Preimage,
 		PaymentStatus: status,
-	}, nil
+	}
+	if status == Succeeded {
+		paymentStatus.FeeSpent, paymentStatus.FeeSpentKnown = clnFeeSpent(response.AmountMsat, response.AmountSentMsat)
+	}
+	return paymentStatus, nil
 }
 
 func (cln *CLNClient) OutgoingPaymentStatus(ctx context.Context, paymentHash string) (PaymentStatus, error) {
@@ -301,9 +346,11 @@ func (cln *CLNClient) OutgoingPaymentStatus(ctx context.Context, paymentHash str
 
 	var listPaysResponse struct {
 		Pays []struct {
-			PaymentHash     string `json:"payment_hash"`
-			Status          string `json:"status"`
-			PaymentPreimage string `json:"preimage,omitempty"`
+			PaymentHash     string      `json:"payment_hash"`
+			Status          string      `json:"status"`
+			AmountMsat      json.Number `json:"amount_msat"`
+			AmountSentMsat  json.Number `json:"amount_sent_msat"`
+			PaymentPreimage string      `json:"preimage,omitempty"`
 		} `json:"pays"`
 	}
 	if err := json.Unmarshal(bodyBytes, &listPaysResponse); err != nil {
@@ -316,7 +363,13 @@ func (cln *CLNClient) OutgoingPaymentStatus(ctx context.Context, paymentHash str
 	payment := listPaysResponse.Pays[0]
 	switch payment.Status {
 	case "complete":
-		return PaymentStatus{PaymentStatus: Succeeded, Preimage: payment.PaymentPreimage}, nil
+		feeSpent, feeKnown := clnFeeSpent(payment.AmountMsat, payment.AmountSentMsat)
+		return PaymentStatus{
+			PaymentStatus:  Succeeded,
+			Preimage:       payment.PaymentPreimage,
+			FeeSpent:       feeSpent,
+			FeeSpentKnown:  feeKnown,
+		}, nil
 	case "failed":
 		return PaymentStatus{PaymentStatus: Failed}, nil
 	default:

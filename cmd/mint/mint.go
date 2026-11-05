@@ -207,6 +207,17 @@ func configFromEnv() (*mint.Config, error) {
 			}
 			fakeBackend.PaymentDelay = delay
 		}
+		// MINT_FAKE_FEE_RESERVE (sats): what every melt quote reserves
+		// (default 0). Fake payments cost nothing, so the whole reserve
+		// returns as NUT-08 change — the knob that makes melt-change
+		// observable on the wire (conformance/audit runs).
+		if reserveEnv, ok := os.LookupEnv("MINT_FAKE_FEE_RESERVE"); ok {
+			reserve, err := strconv.ParseUint(reserveEnv, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid MINT_FAKE_FEE_RESERVE: %v", err)
+			}
+			fakeBackend.FeeReserveSats = reserve
+		}
 		// MINT_FAKE_BACKEND_STATE: durable outgoing-payment file — models
 		// the backend as a process independent of the mint (kill/restart
 		// harness; payments survive the mint's death).

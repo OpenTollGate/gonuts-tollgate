@@ -52,6 +52,12 @@ func (i *FakeBackendInvoice) ToInvoice() Invoice {
 type FakeBackend struct {
 	Invoices     []FakeBackendInvoice
 	PaymentDelay int64
+	// FeeReserveSats: what FeeReserve reports for every amount — the
+	// melt-quote fee_reserve knob (default 0 keeps existing fixtures
+	// unchanged). Fake payments cost nothing, so every payment result
+	// reports FeeSpentKnown with FeeSpent 0 — the whole reserve is
+	// overpaid and must return as NUT-08 change.
+	FeeReserveSats uint64
 	// statePath: when set (LoadState), outgoing entries persist across
 	// restarts — the kill/restart harness models a durable backend.
 	statePath string
@@ -150,6 +156,8 @@ func (fb *FakeBackend) SendPayment(ctx context.Context, request string, maxFee u
 	return PaymentStatus{
 		Preimage:      FakePreimage,
 		PaymentStatus: status,
+		FeeSpent:      0,
+		FeeSpentKnown: true,
 	}, nil
 }
 
@@ -170,9 +178,9 @@ func (fb *FakeBackend) PayPartialAmount(ctx context.Context, request string, amo
 
 	outgoingPayment := FakeBackendInvoice{
 		PaymentHash: invoice.PaymentHash,
-		Preimage:    FakePreimage,
-		Status:      status,
-		Amount:      uint64(invoice.MSatoshi) * 1000,
+		Preimage:   FakePreimage,
+		Status:     status,
+		Amount:     uint64(invoice.MSatoshi) * 1000,
 		AttemptedAt: time.Now().Unix(),
 	}
 	fb.Invoices = append(fb.Invoices, outgoingPayment)
@@ -181,6 +189,8 @@ func (fb *FakeBackend) PayPartialAmount(ctx context.Context, request string, amo
 	return PaymentStatus{
 		Preimage:      FakePreimage,
 		PaymentStatus: status,
+		FeeSpent:      0,
+		FeeSpentKnown: true,
 	}, nil
 }
 
@@ -204,11 +214,13 @@ func (fb *FakeBackend) OutgoingPaymentStatus(ctx context.Context, hash string) (
 	return PaymentStatus{
 		Preimage:      FakePreimage,
 		PaymentStatus: status,
+		FeeSpent:      0,
+		FeeSpentKnown: true,
 	}, nil
 }
 
 func (fb *FakeBackend) FeeReserve(amount uint64) uint64 {
-	return 0
+	return fb.FeeReserveSats
 }
 
 func (fb *FakeBackend) SubscribeInvoice(ctx context.Context, paymentHash string) (InvoiceSubscriptionClient, error) {
