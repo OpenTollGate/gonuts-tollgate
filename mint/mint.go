@@ -1847,8 +1847,12 @@ func (m *Mint) signBlindedMessages(blindedMessages cashu.BlindedMessages) (cashu
 // is checked here, so no post-payment state change can fail on request
 // shape (fund-safety: local validation precedes irreversible operations).
 //
-// NUT-08: blank outputs MUST carry amount 0 (the mint imprints the change
-// amount itself); the keyset MUST be one the mint can sign — the active
+// NUT-08: the outputs' amounts are IGNORED ("Alice MUST set the amount
+// of each blank output to 0, and Bob MUST ignore it, imprinting the
+// amount himself") — wallets legitimately send nonzero amounts here
+// (the reference families accept them; the conformance corpus carries
+// melts that do), and the mint imprints its own amounts at signing time
+// regardless. The keyset MUST be one the mint can sign — the active
 // keyset (signBlindedMessages refuses inactive ones); B_ values must be
 // parseable curve points and unique.
 func (m *Mint) validateMeltChangeOutputs(outputs cashu.BlindedMessages) error {
@@ -1857,9 +1861,6 @@ func (m *Mint) validateMeltChangeOutputs(outputs cashu.BlindedMessages) error {
 	}
 	seen := make(map[string]struct{}, len(outputs))
 	for _, output := range outputs {
-		if output.Amount != 0 {
-			return cashu.InvalidBlindedMessageAmount
-		}
 		if output.Id != m.activeKeyset.Id {
 			return cashu.InactiveKeysetSignatureRequest
 		}

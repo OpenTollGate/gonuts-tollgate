@@ -178,9 +178,9 @@ func (fb *FakeBackend) PayPartialAmount(ctx context.Context, request string, amo
 
 	outgoingPayment := FakeBackendInvoice{
 		PaymentHash: invoice.PaymentHash,
-		Preimage:   FakePreimage,
-		Status:     status,
-		Amount:     uint64(invoice.MSatoshi) * 1000,
+		Preimage:    FakePreimage,
+		Status:      status,
+		Amount:      uint64(invoice.MSatoshi) * 1000,
 		AttemptedAt: time.Now().Unix(),
 	}
 	fb.Invoices = append(fb.Invoices, outgoingPayment)

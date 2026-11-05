@@ -71,10 +71,10 @@ func TestMeltChangeTargetFeeMath(t *testing.T) {
 	const inputs uint64 = amount + reserve + fees // exactly funded
 
 	cases := []struct {
-		name   string
-		inputs uint64
+		name    string
+		inputs  uint64
 		payment lightning.PaymentStatus
-		want   uint64
+		want    uint64
 	}{
 		// backend spent nothing: the whole reserve is overpaid
 		{"fake backend spends nothing", inputs, lightning.PaymentStatus{FeeSpentKnown: true}, reserve},
@@ -390,7 +390,6 @@ func TestMeltChangeValidationRefusedBeforeClaim(t *testing.T) {
 		outputs cashu.BlindedMessages
 		want    error
 	}{
-		{"nonzero amount", withAmount(blankOutputs(t, m, 1), 5), cashu.InvalidBlindedMessageAmount},
 		{"foreign keyset", withKeyset(blankOutputs(t, m, 1), "00deadbeef"), cashu.InactiveKeysetSignatureRequest},
 	}
 	for _, tc := range cases {
@@ -427,9 +426,32 @@ func TestMeltChangeValidationRefusedBeforeClaim(t *testing.T) {
 	}
 }
 
-func withAmount(outputs cashu.BlindedMessages, amount uint64) cashu.BlindedMessages {
-	outputs[0].Amount = amount
-	return outputs
+// NUT-08: "Alice MUST set the amount of each blank output to 0, and Bob
+// MUST ignore it" — wallets legitimately send nonzero amounts on melt
+// outputs (the conformance corpus carries such melts; the reference
+// families accept them), and the mint imprints its own change amounts
+// regardless.
+func TestMeltChangeIgnoresNonzeroBlankAmounts(t *testing.T) {
+	backend := &lightning.FakeBackend{FeeReserveSats: 2}
+	m := newMeltChangeMint(t, backend, "")
+
+	proofs := raceTestProofs(t, m, 24)
+	quote := raceTestMeltQuote(t, m, backend, 21)
+	outputs := blankOutputs(t, m, 2)
+	outputs[0].Amount = 16 // the "amount" wallets send — ignored
+	outputs[1].Amount = 8
+
+	_, change, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+		Quote: quote.Id, Inputs: proofs, Outputs: outputs,
+	})
+	if err != nil {
+		t.Fatalf("melt with nonzero-amount blank outputs must succeed (NUT-08: Bob MUST ignore): %v", err)
+	}
+	// the change is the mint's own math (24 − 21 − 0 fee = 3 → [2,1]),
+	// never the wallet-sent amounts
+	if change.Amount() != 3 || len(change) != 2 || change[0].Amount != 2 || change[1].Amount != 1 {
+		t.Fatalf("change = %v, want [2 1] (mint-imprinted, wallet amounts ignored)", amountsOf(change))
+	}
 }
 
 func withKeyset(outputs cashu.BlindedMessages, id string) cashu.BlindedMessages {

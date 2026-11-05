@@ -54,7 +54,7 @@ type PaymentStatus struct {
 	// and it is FeeSpent" from "this backend cannot report fees" — the
 	// melt path treats unknown as the full fee reserve consumed (never
 	// returns change it cannot account for; fund-safe for the operator).
-	FeeSpent     uint64
+	FeeSpent      uint64
 	FeeSpentKnown bool
 }
 

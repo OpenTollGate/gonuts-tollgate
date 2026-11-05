@@ -201,9 +201,9 @@ func (cln *CLNClient) SendPayment(ctx context.Context, request string, maxFee ui
 	}
 
 	var response struct {
-		Preimage string `json:"payment_preimage"`
-		Status   string `json:"status"`
-		AmountMsat    json.Number `json:"amount_msat"`
+		Preimage       string      `json:"payment_preimage"`
+		Status         string      `json:"status"`
+		AmountMsat     json.Number `json:"amount_msat"`
 		AmountSentMsat json.Number `json:"amount_sent_msat"`
 	}
 	if err := json.Unmarshal(bodyBytes, &response); err != nil {
@@ -294,8 +294,8 @@ func (cln *CLNClient) PayPartialAmount(
 	}
 
 	var response struct {
-		Preimage string `json:"payment_preimage"`
-		Status   string `json:"status"`
+		Preimage       string      `json:"payment_preimage"`
+		Status         string      `json:"status"`
 		AmountMsat     json.Number `json:"amount_msat"`
 		AmountSentMsat json.Number `json:"amount_sent_msat"`
 	}
@@ -365,10 +365,10 @@ func (cln *CLNClient) OutgoingPaymentStatus(ctx context.Context, paymentHash str
 	case "complete":
 		feeSpent, feeKnown := clnFeeSpent(payment.AmountMsat, payment.AmountSentMsat)
 		return PaymentStatus{
-			PaymentStatus:  Succeeded,
-			Preimage:       payment.PaymentPreimage,
-			FeeSpent:       feeSpent,
-			FeeSpentKnown:  feeKnown,
+			PaymentStatus: Succeeded,
+			Preimage:      payment.PaymentPreimage,
+			FeeSpent:      feeSpent,
+			FeeSpentKnown: feeKnown,
 		}, nil
 	case "failed":
 		return PaymentStatus{PaymentStatus: Failed}, nil

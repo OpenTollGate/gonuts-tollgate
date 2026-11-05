@@ -25,12 +25,12 @@ import (
 // --- unit: the binding disciplines on constructMeltChangeProofs ---
 
 type changeFixture struct {
-	blanks   cashu.BlindedMessages
-	secrets  []string
-	rs       []*secp256k1.PrivateKey
-	keyset   crypto.WalletKeyset
-	privs    map[uint64]*secp256k1.PrivateKey
-	sigs     cashu.BlindedSignatures
+	blanks  cashu.BlindedMessages
+	secrets []string
+	rs      []*secp256k1.PrivateKey
+	keyset  crypto.WalletKeyset
+	privs   map[uint64]*secp256k1.PrivateKey
+	sigs    cashu.BlindedSignatures
 }
 
 // newChangeFixture builds n blank outputs against a local keyset and
