@@ -324,6 +324,12 @@ func intentBlindingFactors(intent *storage.PendingSwapIntent) []*secp256k1.Priva
 // re-executed. cdk-mintd emits exactly
 // {"code":11001,"detail":"Token Already Spent"} for a swap re-POST once
 // its NUT-19 response cache no longer holds the original answer.
+// Pending inputs are a different identity (spec 11002, emitted by this
+// mint since the #68 error-identity fix; gonuts previously conflated
+// the two under 11001) and deliberately do NOT match: a pending answer
+// is ambiguous — the mint may still be holding the inputs for an
+// in-flight settlement — so the caller keeps the intent journaled and
+// retries instead of recovering.
 func isProofsAlreadySpentRefusal(body []byte) bool {
 	var mintErr cashu.Error
 	if err := json.Unmarshal(body, &mintErr); err != nil {

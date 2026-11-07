@@ -489,8 +489,18 @@ func (e Error) Error() string {
 	return e.Detail
 }
 
-// Common error codes
+// Error codes follow the spec table in nuts/error_codes.md
+// (10001 proof verification failed; 11001–11017 transaction classes;
+// 12001–12003 keysets; 20001–20009 quotes; 30001–30002 / 31001–31004
+// NUT-21/22 auth). Every condition that table assigns is emitted with
+// its spec code. Conditions the table does NOT assign (payment-method
+// routing, unknown quote id, melt-quote request validation, NUT-11
+// witness and NUT-14 HTLC failures) are emitted from the private 41xxx
+// block below — outside every spec-allocated range, so a wallet that
+// branches on numeric codes can never mistake them for a spec class
+// (cashu-audit #68 item A / FINDINGS-2026-11-04-error-identity).
 const (
+	// No spec class: generic NUT-00 envelope fallback.
 	StandardErrCode CashuErrCode = 10000
 	// These will never be returned in a response.
 	// Using them to identify internally where
@@ -498,17 +508,34 @@ const (
 	DBErrCode               CashuErrCode = 1
 	LightningBackendErrCode CashuErrCode = 2
 
-	BlindedMessageAlreadySignedErrCode CashuErrCode = 10002
-	InvalidProofErrCode                CashuErrCode = 10003
-	SecretTooLongErrCode               CashuErrCode = 10004
+	// 10001: proof verification failed (spec).
+	InvalidProofErrCode CashuErrCode = 10001
+	// No spec class: secret exceeds MAX_SECRET_LENGTH.
+	SecretTooLongErrCode CashuErrCode = 10004
 
-	ProofAlreadyUsedErrCode        CashuErrCode = 11001
-	InsufficientProofAmountErrCode CashuErrCode = 11002
-	PaymentMethodErrCode           CashuErrCode = 11003
-	UnitErrCode                    CashuErrCode = 11005
-	AmountLimitExceeded            CashuErrCode = 11006
-	DuplicateInputErrCode          CashuErrCode = 11007
-	DuplicateOutputErrCode         CashuErrCode = 11008
+	// 11001: proofs already spent (spec).
+	ProofAlreadyUsedErrCode CashuErrCode = 11001
+	// 11002: proofs are pending (spec) — distinct from spent since the
+	// #68 error-identity fix (they previously shared 11001, so a wallet
+	// could not tell an in-flight melt from a consumed input).
+	ProofPendingErrCode CashuErrCode = 11002
+	// 11003: outputs already signed (spec; was the legacy 10002).
+	BlindedMessageAlreadySignedErrCode CashuErrCode = 11003
+	// 11005: transaction is not balanced, inputs != outputs (spec; was
+	// the private-meaning 11002, which the spec books for pending).
+	InsufficientProofAmountErrCode CashuErrCode = 11005
+	// 11006: amount outside of limit range (spec; zero-amount quotes
+	// were previously the non-spec 20010).
+	AmountLimitExceeded        CashuErrCode = 11006
+	MintQuoteZeroAmountErrCode CashuErrCode = 11006
+	DuplicateInputErrCode      CashuErrCode = 11007
+	DuplicateOutputErrCode     CashuErrCode = 11008
+	// 11013: unit in request is not supported (spec; was 11005, which
+	// the spec books for not-balanced).
+	UnitErrCode CashuErrCode = 11013
+	// 11016: NUT-29 duplicate quote ids in a batch (nuts/29.md
+	// validation rule 2).
+	DuplicateQuotesErrCode CashuErrCode = 11016
 
 	UnknownKeysetErrCode  CashuErrCode = 12001
 	InactiveKeysetErrCode CashuErrCode = 12002
@@ -522,11 +549,19 @@ const (
 	MeltQuotePendingErrCode     CashuErrCode = 20005
 	MeltQuoteAlreadyPaidErrCode CashuErrCode = 20006
 
-	MeltQuoteErrCode CashuErrCode = 20009
-	// NUT-04: quote amounts MUST be positive integers.
-	MintQuoteZeroAmountErrCode CashuErrCode = 20010
-	// NUT-29: duplicate quote ids in a batch (nuts/29.md validation rule 2).
-	DuplicateQuotesErrCode CashuErrCode = 11016
+	// Private 41xxx block — conditions error_codes.md does not assign.
+	// 41001: route method not supported (NUT-04/05 define bolt11 only;
+	// was 11003, which the spec books for outputs-already-signed).
+	PaymentMethodErrCode CashuErrCode = 41001
+	// 41002: quote id not found (no spec code; was 20009, which the
+	// spec books for NUT-20 pubkey-required).
+	QuoteNotExistErrCode CashuErrCode = 41002
+	// 41003: melt-quote request rejected at validation (unparseable or
+	// amountless invoice, refused MPP) — no spec code; was 20009.
+	MeltQuoteRequestErrCode CashuErrCode = 41003
+	// 41004: a melt quote already exists for this payment request — no
+	// spec code; was 20009.
+	MeltQuoteExistsErrCode CashuErrCode = 41004
 )
 
 var (
@@ -547,18 +582,18 @@ var (
 	MintQuoteInvalidSigErr       = Error{Detail: "Mint quote with pubkey but no valid signature provided.", Code: MintQuoteInvalidSigErrCode}
 	OutputsOverQuoteAmountErr    = Error{Detail: "sum of the output amounts is greater than quote amount", Code: StandardErrCode}
 	ProofAlreadyUsedErr          = Error{Detail: "proof already used", Code: ProofAlreadyUsedErrCode}
-	ProofPendingErr              = Error{Detail: "proof is pending", Code: ProofAlreadyUsedErrCode}
+	ProofPendingErr              = Error{Detail: "proof is pending", Code: ProofPendingErrCode}
 	InvalidProofErr              = Error{Detail: "invalid proof", Code: InvalidProofErrCode}
 	SecretTooLongErr             = Error{Detail: "secret too long", Code: SecretTooLongErrCode}
 	NoProofsProvided             = Error{Detail: "no proofs provided", Code: InvalidProofErrCode}
 	DuplicateProofs              = Error{Detail: "duplicate inputs", Code: DuplicateInputErrCode}
 	DuplicateOutputs             = Error{Detail: "duplicate outputs", Code: DuplicateOutputErrCode}
-	QuoteNotExistErr             = Error{Detail: "quote does not exist", Code: MeltQuoteErrCode}
+	QuoteNotExistErr             = Error{Detail: "quote does not exist", Code: QuoteNotExistErrCode}
 	QuotePending                 = Error{Detail: "quote is pending", Code: MeltQuotePendingErrCode}
 	LightningPaymentFailed       = Error{Detail: "Lightning payment failed", Code: LightningPaymentErrCode}
 	MeltQuoteAlreadyPaid         = Error{Detail: "quote already paid", Code: MeltQuoteAlreadyPaidErrCode}
 	MeltAmountExceededErr        = Error{Detail: "max amount for melting exceeded", Code: AmountLimitExceeded}
-	MeltQuoteForRequestExists    = Error{Detail: "melt quote for payment request already exists", Code: MeltQuoteErrCode}
+	MeltQuoteForRequestExists    = Error{Detail: "melt quote for payment request already exists", Code: MeltQuoteExistsErrCode}
 	InsufficientProofsAmount     = Error{
 		Detail: "amount of input proofs is below amount needed for transaction",
 		Code:   InsufficientProofAmountErrCode,

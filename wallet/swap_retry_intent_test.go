@@ -8,13 +8,14 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut10"
 )
 
-// The 10002 retry path must not leak its superseded intent: the mint's
-// "outputs already signed" is a definitive refusal (inputs not consumed),
+// The outputs-already-signed (spec 11003, formerly 10002) retry path must
+// not leak its superseded intent: the mint's "outputs already signed" is a
+// definitive refusal (inputs not consumed),
 // so the first attempt's intent is unrecoverable-by-design and deleting it
 // keeps the pending set exactly the set of ambiguous outcomes. Without the
 // delete, every retried swap leaves an immortal phantom that resurfaces as
 // a failed entry at every ResumePendingSwaps.
-func Test10002RetryDeletesSupersededIntent(t *testing.T) {
+func TestAlreadySignedRetryDeletesSupersededIntent(t *testing.T) {
 	m := newSigningMint(t)
 	w, err := LoadWallet(Config{WalletPath: t.TempDir(), CurrentMintURL: m.server.URL})
 	if err != nil {
@@ -32,7 +33,7 @@ func Test10002RetryDeletesSupersededIntent(t *testing.T) {
 		t.Fatalf("createSwapRequest: %v", err)
 	}
 
-	// The mint refuses the FIRST attempt with 10002; the wallet's retry
+	// The mint refuses the FIRST attempt with outputs-already-signed; the wallet's retry
 	// (fresh outputs, fresh range) reaches the fixture mint and succeeds.
 	origSwap := swap
 	defer func() { swap = origSwap }()
@@ -69,11 +70,11 @@ func Test10002RetryDeletesSupersededIntent(t *testing.T) {
 		t.Fatalf("DeletePendingSwap: %v", err)
 	}
 	if n := len(w.db.GetPendingSwaps()); n != 0 {
-		t.Fatalf("a completed 10002-retried swap must leave ZERO intents, have %d", n)
+		t.Fatalf("a completed already-signed-retried swap must leave ZERO intents, have %d", n)
 	}
 }
 
-// Non-10002 errors keep the intent: the delete is scoped to the definitive
+// Other errors keep the intent: the delete is scoped to the definitive
 // refusal, never to ambiguity.
 func TestNonRefusalErrorKeepsIntent(t *testing.T) {
 	m := newSigningMint(t)

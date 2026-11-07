@@ -11,7 +11,8 @@ import (
 )
 
 // TestSwapWithRetryReservesRetryRange pins the invariant behind tollgate
-// #495: when the mint rejects the first swap range with 10002 and
+// #495: when the mint rejects the first swap range with outputs-already-
+// signed (spec 11003, formerly 10002) and
 // swapWithRetry regenerates fresh outputs, the retry's derivation range
 // must be persisted (counter incremented) before it is sent. Without it
 // the counter trails the last exposed range and every later first attempt

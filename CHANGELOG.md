@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Wire-visible**: mint error codes now follow the nuts/error_codes.md
+  spec table (cashu-audit #68 item A /
+  FINDINGS-2026-11-04-error-identity). Four codes collided with
+  different spec classes and one distinction was lost; every emitted
+  condition that the spec table assigns now carries its spec code, with
+  detail messages unchanged: outputs-already-signed 10002 → **11003**;
+  unbalanced transaction (insufficient inputs) 11002 → **11005**;
+  unit-unsupported 11005 → **11013**; proof-verification failures
+  (invalid/forged/unparseable C) 10003/10000 → **10001**; zero-amount
+  quote 20010 → **11006**; pending proofs now **11002**, no longer
+  conflated with spent 11001. Conditions the spec table does NOT assign
+  (payment method unsupported; quote does not exist; melt-quote request
+  validation incl. invalid invoice and refused MPP; melt quote already
+  exists; NUT-11 witness failures; NUT-14 HTLC failures) vacated the
+  spec-allocated codes they squatted (11003, 20009 — the spec books it
+  for NUT-20 pubkey-required — and the NUT-21/22 3xxxx range) and moved
+  to a documented private 41xxx block (41001–41004, 41011, 41014).
+  Compat surface: a wallet branching on the OLD numeric literals sees
+  changed codes for these conditions (a gonuts wallet comparing against
+  this package's constants is unaffected — the retry-on-outputs-signed
+  and spent-recovery paths follow the constants and now also stop
+  misreading a pending answer as spent).
+
 ### Fixed
 - Melt-quote double-settlement: atomic UNPAID→PENDING CAS before payment
   (two concurrent melts on one quote both paid); failure paths roll the

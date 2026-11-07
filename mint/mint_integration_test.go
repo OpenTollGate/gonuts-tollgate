@@ -590,7 +590,7 @@ func TestMeltQuoteState(t *testing.T) {
 	// test invalid quote id
 	_, err = testMint.GetMeltQuoteState(ctx, "quote1234")
 	if !errors.Is(err, cashu.QuoteNotExistErr) {
-		t.Fatalf("expected error '%v' but got '%v' instead", cashu.PaymentMethodNotSupportedErr, err)
+		t.Fatalf("expected error '%v' but got '%v' instead", cashu.QuoteNotExistErr, err)
 	}
 
 	// test before paying melt

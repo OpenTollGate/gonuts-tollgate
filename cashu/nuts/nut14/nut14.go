@@ -16,7 +16,11 @@ import (
 )
 
 const (
-	NUT14ErrCode cashu.CashuErrCode = 30004
+	// Error code: HTLC preimage/hash failures have no error_codes.md
+	// class, and the 3xxxx range they previously squatted is
+	// spec-allocated to NUT-21/22 auth — emitted from the private 41xxx
+	// block instead (cashu-audit #68 item A).
+	NUT14ErrCode cashu.CashuErrCode = 41014
 )
 
 // NUT-14: specific errors
