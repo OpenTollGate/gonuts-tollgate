@@ -897,10 +897,10 @@ func (m *Mint) RequestMeltQuote(meltQuoteRequest nut05.PostMeltQuoteBolt11Reques
 	bolt11, err := decodepay.Decodepay(request)
 	if err != nil {
 		errmsg := fmt.Sprintf("invalid invoice: %v", err)
-		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.MeltQuoteErrCode)
+		return storage.MeltQuote{}, cashu.BuildCashuError(errmsg, cashu.MeltQuoteRequestErrCode)
 	}
 	if bolt11.MSatoshi == 0 {
-		return storage.MeltQuote{}, cashu.BuildCashuError("invoice has no amount", cashu.MeltQuoteErrCode)
+		return storage.MeltQuote{}, cashu.BuildCashuError("invoice has no amount", cashu.MeltQuoteRequestErrCode)
 	}
 	invoiceSatAmount := uint64(bolt11.MSatoshi) / 1000
 	quoteAmount := invoiceSatAmount
@@ -922,14 +922,14 @@ func (m *Mint) RequestMeltQuote(meltQuoteRequest nut05.PostMeltQuoteBolt11Reques
 				// if this is an internal invoice, reject MPP request
 				if isInternal {
 					return storage.MeltQuote{},
-						cashu.BuildCashuError("mpp for internal invoice is not allowed", cashu.MeltQuoteErrCode)
+						cashu.BuildCashuError("mpp for internal invoice is not allowed", cashu.MeltQuoteRequestErrCode)
 				}
 
 				// check mpp msat amount is less than invoice amount
 				if mpp.AmountMsat >= uint64(bolt11.MSatoshi) {
 					return storage.MeltQuote{},
 						cashu.BuildCashuError("mpp amount is not less than amount in invoice",
-							cashu.MeltQuoteErrCode)
+							cashu.MeltQuoteRequestErrCode)
 				}
 				isMpp = true
 				amountMsat = mpp.AmountMsat
@@ -938,7 +938,7 @@ func (m *Mint) RequestMeltQuote(meltQuoteRequest nut05.PostMeltQuoteBolt11Reques
 					quoteAmount, invoiceSatAmount)
 			} else {
 				return storage.MeltQuote{},
-					cashu.BuildCashuError("MPP is not supported", cashu.MeltQuoteErrCode)
+					cashu.BuildCashuError("MPP is not supported", cashu.MeltQuoteRequestErrCode)
 			}
 		}
 	}
@@ -1574,12 +1574,12 @@ func (m *Mint) verifyProofs(proofs cashu.Proofs, Ys []string) error {
 		Cbytes, err := hex.DecodeString(proof.C)
 		if err != nil {
 			errmsg := fmt.Sprintf("invalid C: %v", err)
-			return cashu.BuildCashuError(errmsg, cashu.StandardErrCode)
+			return cashu.BuildCashuError(errmsg, cashu.InvalidProofErrCode)
 		}
 
 		C, err := secp256k1.ParsePubKey(Cbytes)
 		if err != nil {
-			return cashu.BuildCashuError(err.Error(), cashu.StandardErrCode)
+			return cashu.BuildCashuError(err.Error(), cashu.InvalidProofErrCode)
 		}
 
 		if !crypto.Verify(proof.Secret, k, C) {

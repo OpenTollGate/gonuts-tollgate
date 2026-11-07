@@ -969,7 +969,7 @@ var swap = func(mint string, swapRequest swapRequestPayload) (cashu.Proofs, erro
 // The retry's derivation range must be persisted (counter incremented)
 // before it is sent, exactly like the first attempt: an unpersisted retry
 // range leaves the counter below the last exposed range, so every later
-// first attempt re-derives it and eats a guaranteed 10002 — and a crash
+// first attempt re-derives it and eats a guaranteed outputs-already-signed refusal — and a crash
 // between retry-send and success would replay it after restart.
 func newSwapOpID() string {
 	b := make([]byte, 16)
@@ -1029,7 +1029,7 @@ func (w *Wallet) swapWithRetry(
 	if err != nil {
 		var cashuErr cashu.Error
 		if errors.As(err, &cashuErr) && cashuErr.Code == cashu.BlindedMessageAlreadySignedErrCode {
-			// 10002 is a definitive refusal — the mint rejected the request
+			// Outputs-already-signed (spec 11003) is a definitive refusal — the mint rejected the request
 			// before consuming the inputs (it has seen these outputs already)
 			// — so the superseded first intent is never recoverable by
 			// replay and would otherwise resurface as an immortal failed

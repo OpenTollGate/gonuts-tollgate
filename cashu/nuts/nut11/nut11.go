@@ -30,8 +30,11 @@ const (
 	SIGINPUTS = "SIG_INPUTS"
 	SIGALL    = "SIG_ALL"
 
-	// Error code
-	NUT11ErrCode cashu.CashuErrCode = 30001
+	// Error code: witness/spending-condition failures have no
+	// error_codes.md class, and the 3xxxx range they previously squatted
+	// is spec-allocated to NUT-21/22 auth — emitted from the private
+	// 41xxx block instead (cashu-audit #68 item A).
+	NUT11ErrCode cashu.CashuErrCode = 41011
 )
 
 // NUT-11: specific errors
