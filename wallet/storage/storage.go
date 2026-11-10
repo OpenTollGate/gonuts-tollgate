@@ -36,6 +36,7 @@ type WalletDB interface {
 	SaveProofs(cashu.Proofs) error
 	GetProofs() cashu.Proofs
 	GetProofsByKeysetId(string) cashu.Proofs
+	GetProofsByKeysetUnit(string) cashu.Proofs
 	DeleteProof(string) error
 
 	AddPendingProofs(cashu.Proofs) error
