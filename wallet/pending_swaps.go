@@ -143,9 +143,7 @@ func (w *Wallet) resumeOneMint(intent *storage.PendingSwapIntent) (uint64, error
 // resumeOneMelt replays a /v1/melt/bolt11 request. cdk-mintd replays
 // melts idempotently — a paid quote re-POSTed with identical bytes
 // returns state PAID with the same change signatures (verified live) —
-// and since the NUT-08 branch so does the gonuts mint (identical blank
-// outputs answer from the stored signatures, cache or no cache), so the
-// persisted factors recover the change exactly as in swaps.
+// so the persisted factors recover the change exactly as in swaps.
 func (w *Wallet) resumeOneMelt(intent *storage.PendingSwapIntent) (uint64, error) {
 	url := intent.MintURL
 	if len(url) == 0 || url[len(url)-1] != '/' {
@@ -179,65 +177,7 @@ func (w *Wallet) resumeOneMelt(intent *storage.PendingSwapIntent) (uint64, error
 		}
 		return 0, nil
 	}
-	return w.finishMeltChangeResume(intent, meltResponse.Change)
-}
-
-// finishMeltChangeResume unblinds recovered NUT-08 change against the
-// journaled blank outputs and derivation material (the melt sibling of
-// finishRecoveredSwap): the signatures answer the outputs at the same
-// indexes, are bounded by what the journaled inputs overpaid, proofs are
-// stored, and the intent retired. Failure keeps the intent journaled —
-// never a guess.
-func (w *Wallet) finishMeltChangeResume(intent *storage.PendingSwapIntent, change cashu.BlindedSignatures) (uint64, error) {
-	keyset := w.db.GetKeyset(intent.KeysetID)
-	if keyset == nil {
-		return 0, fmt.Errorf("keyset %s no longer in wallet db (rotated away?)", intent.KeysetID)
-	}
-
-	// bound the change by the journaled request's own overpay: inputs
-	// minus the invoice amount (input fees shrink the real overpay, so
-	// this is the ceiling; the quote record may be missing after a
-	// migration — then the inputs alone bound it)
-	maxChange := uint64(0)
-	var request nut05.PostMeltBolt11Request
-	if err := json.Unmarshal(intent.RequestBytes, &request); err == nil {
-		maxChange = request.Inputs.Amount()
-		if quote := w.db.GetMeltQuoteById(request.Quote); quote != nil && maxChange >= quote.Amount {
-			maxChange -= quote.Amount
-		}
-	}
-	if maxChange == 0 {
-		return 0, fmt.Errorf("melt intent %s has no overpay to bound change against — keeping the intent journaled", intent.OpID)
-	}
-
-	proofs, err := constructMeltChangeProofs(
-		change,
-		intent.Outputs,
-		intent.Secrets,
-		intentBlindingFactors(intent),
-		keyset,
-		maxChange,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("could not unblind recovered melt change: %w", err)
-	}
-	if err := w.db.SaveProofs(proofs); err != nil {
-		return 0, fmt.Errorf("could not store recovered change proofs: %w", err)
-	}
-
-	// the melt consumed its inputs; make sure no stale copy lingers (the
-	// live path already deleted them — ProofNotFound is fine)
-	for _, proof := range request.Inputs {
-		if dErr := w.db.DeleteProof(proof.Secret); dErr != nil && !errors.Is(dErr, storage.ProofNotFound) {
-			return 0, fmt.Errorf("change stored but input proof %s not retired: %w", truncateForLog([]byte(proof.Secret), 16), dErr)
-		}
-	}
-
-	if err := w.db.DeletePendingSwap(intent.OpID); err != nil {
-		return 0, fmt.Errorf("change stored but intent %s not deleted: %w", intent.OpID, err)
-	}
-	log.Printf("wallet: pending melt %s recovered %d sats NUT-08 change from %s", intent.OpID, proofs.Amount(), intent.MintURL)
-	return proofs.Amount(), nil
+	return w.finishResume(intent, meltResponse.Change)
 }
 
 func (w *Wallet) resumeOneSwap(intent *storage.PendingSwapIntent) (uint64, error) {

@@ -32,9 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same keyset, no more signatures than blanks, keyset denominations
   only, total bounded by the wallet's own overpay; DLEQ verified) — the
   swap-response binding (#38) had made every real change answer fail
-  after the invoice was already paid. Melt crash-recovery unblinds
-  recovered change through the same disciplines (the old resume tail
-  mis-passed the full blank set and failed on any partial change).
+  after the invoice was already paid. Melt crash-recovery itself is
+  ceded to #46 (GET-first + NUT-09 recovery per cashu-audit #67 §10–11);
+  this PR carries only the live-path change consumption.
 - Melt blank-output amounts are ignored per NUT-08 ("Bob MUST ignore
   it, imprinting the amount himself") — wallets legitimately send
   nonzero amounts there and the reference families accept them.
