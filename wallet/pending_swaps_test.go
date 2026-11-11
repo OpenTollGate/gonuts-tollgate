@@ -54,6 +54,11 @@ type signingMint struct {
 	restoreCalls    int
 	restoreErr      bool
 	dropLastRestore bool
+	// meltChangeAmounts, when set, makes /v1/melt/bolt11 assign POSITIVE
+	// mint-imprinted amounts to the blank outputs (the NUT-08 honest
+	// shape); when nil the historical behavior stands (sign at the
+	// request's amount-0 blanks). Length may be shorter than the outputs.
+	meltChangeAmounts []uint64
 }
 
 func newSigningMint(t *testing.T) *signingMint {
@@ -164,23 +169,49 @@ func newSigningMint(t *testing.T) *signingMint {
 		sigs, seen := m.meltChangeCache[key]
 		if !seen {
 			sigs = []cashu.BlindedSignature{}
-			for _, out := range req.Outputs {
-				B_, err := hex.DecodeString(out.B_)
-				if err != nil {
-					http.Error(w, "bad B_", 400)
-					return
+			if m.meltChangeAmounts != nil {
+				// NUT-08 shape: the mint imprints the change amounts on
+				// the blank outputs (index order, value signatures only)
+				for i, amount := range m.meltChangeAmounts {
+					if i >= len(req.Outputs) {
+						break
+					}
+					B_, err := hex.DecodeString(req.Outputs[i].B_)
+					if err != nil {
+						http.Error(w, "bad B_", 400)
+						return
+					}
+					BPub, err := secp256k1.ParsePubKey(B_)
+					if err != nil {
+						http.Error(w, "bad point", 400)
+						return
+					}
+					C_ := crypto.SignBlindedMessage(BPub, m.privs[amount])
+					sigs = append(sigs, cashu.BlindedSignature{
+						Amount: amount,
+						Id:     m.keyset.Id,
+						C_:     hex.EncodeToString(C_.SerializeCompressed()),
+					})
 				}
-				BPub, err := secp256k1.ParsePubKey(B_)
-				if err != nil {
-					http.Error(w, "bad point", 400)
-					return
+			} else {
+				for _, out := range req.Outputs {
+					B_, err := hex.DecodeString(out.B_)
+					if err != nil {
+						http.Error(w, "bad B_", 400)
+						return
+					}
+					BPub, err := secp256k1.ParsePubKey(B_)
+					if err != nil {
+						http.Error(w, "bad point", 400)
+						return
+					}
+					C_ := crypto.SignBlindedMessage(BPub, m.privs[out.Amount])
+					sigs = append(sigs, cashu.BlindedSignature{
+						Amount: out.Amount,
+						Id:     m.keyset.Id,
+						C_:     hex.EncodeToString(C_.SerializeCompressed()),
+					})
 				}
-				C_ := crypto.SignBlindedMessage(BPub, m.privs[out.Amount])
-				sigs = append(sigs, cashu.BlindedSignature{
-					Amount: out.Amount,
-					Id:     m.keyset.Id,
-					C_:     hex.EncodeToString(C_.SerializeCompressed()),
-				})
 			}
 			m.meltChangeCache[key] = sigs
 		}

@@ -1340,14 +1340,24 @@ func (w *Wallet) Melt(quoteId string) (*nut05.PostMeltQuoteBolt11Response, error
 		// here: the whole blank-output range was already reserved before the
 		// request was sent, and the change signatures live inside it.
 		if change > 0 {
-			changeProofs, err := constructProofs(
+			// the bound on what a honest mint may return: the wallet's own
+			// overpay (inputs beyond the invoice and the input fees — the
+			// backend fee is spent money and can only shrink it)
+			maxChange, err := overpayBound(proofs, &mint, quote.Amount)
+			if err != nil {
+				return nil, fmt.Errorf("error pricing melt inputs for change bound: %w", err)
+			}
+			changeProofs, err := constructMeltChangeProofs(
 				meltBolt11Response.Change,
-				outputs[:change],
-				outputsSecrets[:change],
-				outputsRs[:change],
+				outputs,
+				outputsSecrets,
+				outputsRs,
 				activeKeyset,
+				maxChange,
 			)
 			if err != nil {
+				// the melt PAID — the change stays recoverable from the
+				// durable intent (resume replays the identical request)
 				return nil, fmt.Errorf("error unblinding signature from change: %w", err)
 			}
 			if err := w.db.SaveProofs(changeProofs); err != nil {
@@ -2267,6 +2277,101 @@ func unblindSignature(C_str string, r *secp256k1.PrivateKey, key *secp256k1.Publ
 	C := crypto.UnblindSignature(C_, r, key)
 	Cstr := hex.EncodeToString(C.SerializeCompressed())
 	return Cstr, nil
+}
+
+// constructMeltChangeProofs unblinds NUT-08 melt change into proofs.
+// Unlike the swap path's binding (#38 lineage), the AMOUNT on each
+// signature is mint-authoritative — NUT-08: the wallet sends blank
+// outputs at amount 0 and the mint imprints the overpay itself. The
+// binding that survives is positional and per-keyset: signature i must
+// answer blank output i (same keyset id, compared case-insensitively
+// like every other id comparison against mint-supplied spellings), the
+// signature set may not exceed the blanks sent, every amount must be a
+// denomination of the wallet's keyset, and the TOTAL may not exceed
+// maxChange (what the wallet's own inputs overpaid beyond the invoice
+// and input fees) — a mint returning more than that is hostile or
+// broken, and its value is refused rather than booked.
+func constructMeltChangeProofs(
+	change cashu.BlindedSignatures,
+	blanks cashu.BlindedMessages,
+	secrets []string,
+	rs []*secp256k1.PrivateKey,
+	keyset *crypto.WalletKeyset,
+	maxChange uint64,
+) (cashu.Proofs, error) {
+	if len(change) > len(blanks) {
+		return nil, fmt.Errorf("melt change carries %d signatures for %d blank outputs — tampered or hostile mint answer", len(change), len(blanks))
+	}
+	if len(secrets) < len(change) || len(rs) < len(change) {
+		return nil, errors.New("lengths do not match")
+	}
+	if change.Amount() > maxChange {
+		return nil, fmt.Errorf("melt change %d sats exceeds the %d sats the inputs overpaid — tampered or hostile mint answer", change.Amount(), maxChange)
+	}
+
+	proofs := make(cashu.Proofs, len(change))
+	for i, blindedSignature := range change {
+		// the keyset the signature answers must be the keyset the blank
+		// output asked for at THIS index — a relabeled id would re-key
+		// the proof to a keyset the wallet cannot price
+		if !strings.EqualFold(blindedSignature.Id, blanks[i].Id) {
+			return nil, fmt.Errorf("melt change signature %d answers keyset %q, blank output %d asked %q — tampered or hostile mint answer",
+				i, blindedSignature.Id, i, blanks[i].Id)
+		}
+		pubkey, ok := keyset.PublicKeys[blindedSignature.Amount]
+		if !ok {
+			return nil, fmt.Errorf("melt change amount %d has no key in keyset %s", blindedSignature.Amount, keyset.Id)
+		}
+
+		var dleq *cashu.DLEQProof
+		if blindedSignature.DLEQ != nil {
+			if !nut12.VerifyBlindSignatureDLEQ(
+				*blindedSignature.DLEQ,
+				pubkey,
+				blanks[i].B_,
+				blindedSignature.C_,
+			) {
+				return nil, errors.New("got change signature with invalid DLEQ proof")
+			}
+			dleq = &cashu.DLEQProof{
+				E: blindedSignature.DLEQ.E,
+				S: blindedSignature.DLEQ.S,
+				R: hex.EncodeToString(rs[i].Serialize()),
+			}
+		}
+
+		C, err := unblindSignature(blindedSignature.C_, rs[i], pubkey)
+		if err != nil {
+			return nil, err
+		}
+
+		proof := cashu.Proof{
+			Amount: blindedSignature.Amount,
+			Secret: secrets[i],
+			C:      C,
+			Id:     blindedSignature.Id,
+			DLEQ:   dleq,
+		}
+		proofs[i] = proof
+	}
+
+	return proofs, nil
+}
+
+// overpayBound is the maximum NUT-08 change an honest melt of `proofs`
+// for this quote can return: everything above the invoice amount and the
+// inputs' own fees (a Lightning fee actually spent can only shrink the
+// real overpay, so this bound is the ceiling).
+func overpayBound(proofs cashu.Proofs, mint *walletMint, quoteAmount uint64) (uint64, error) {
+	fees, err := feesForProofs(proofs, mint)
+	if err != nil {
+		return 0, err
+	}
+	total := proofs.Amount()
+	if total < quoteAmount+uint64(fees) {
+		return 0, fmt.Errorf("melt inputs %d sats cannot cover amount %d + fees %d", total, quoteAmount, fees)
+	}
+	return total - quoteAmount - uint64(fees), nil
 }
 
 // keyset passed should exist in wallet

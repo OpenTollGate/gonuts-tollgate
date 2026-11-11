@@ -56,6 +56,18 @@ type MintDB interface {
 	GetBlindSignature(B_ string) (cashu.BlindedSignature, error)
 	GetBlindSignatures(B_s []string) (cashu.BlindedSignatures, error)
 
+	// SaveMeltChangeOutputs journals a melt request's NUT-08 blank
+	// outputs for the quote (one transaction: replace-all per quote).
+	// Written at claim time, BEFORE the payment attempt, so every state
+	// in which a payment can exist has its change destinations durable —
+	// the melt-path sibling of the mint saga's reserve-before-sign
+	// discipline (cashu-audit #59): change signatures are recoverable
+	// after any crash point between payment and response.
+	SaveMeltChangeOutputs(quoteId string, outputs cashu.BlindedMessages) error
+	// GetMeltChangeOutputs returns the journaled blank outputs for the
+	// quote in request order (empty slice when none were sent).
+	GetMeltChangeOutputs(quoteId string) (cashu.BlindedMessages, error)
+
 	// these return a map of keyset id and amount
 	GetIssuedEcash() (map[string]uint64, error)
 	GetRedeemedEcash() (map[string]uint64, error)

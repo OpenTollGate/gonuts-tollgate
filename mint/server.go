@@ -659,6 +659,10 @@ func (ms *MintServer) meltQuoteState(rw http.ResponseWriter, req *http.Request) 
 		State:      meltQuote.State,
 		Expiry:     meltQuote.Expiry,
 		Preimage:   meltQuote.Preimage,
+		// NUT-08: a wallet that missed the melt response can still
+		// collect its change from the quote-state endpoint (the stored
+		// signatures, in blank-output order)
+		Change: ms.mint.MeltQuoteChange(meltQuote.Id),
 	}
 
 	jsonRes, err := json.Marshal(&quoteState)
@@ -711,7 +715,7 @@ func (ms *MintServer) meltTokens(rw http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	meltQuote, err := ms.mint.MeltTokens(ctx, meltTokensRequest)
+	meltQuote, change, err := ms.mint.MeltTokens(ctx, meltTokensRequest)
 	if err != nil {
 		cashuErr, ok := err.(*cashu.Error)
 		// note: if there was internal error from lightning backend
@@ -739,6 +743,7 @@ func (ms *MintServer) meltTokens(rw http.ResponseWriter, req *http.Request) {
 		State:      meltQuote.State,
 		Expiry:     meltQuote.Expiry,
 		Preimage:   meltQuote.Preimage,
+		Change:     change,
 	}
 
 	jsonRes, err := json.Marshal(&meltQuoteResponse)

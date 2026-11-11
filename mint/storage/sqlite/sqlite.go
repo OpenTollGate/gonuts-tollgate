@@ -825,6 +825,62 @@ func (sqlite *SQLiteDB) GetBlindSignatures(B_s []string) (cashu.BlindedSignature
 	return signatures, nil
 }
 
+// SaveMeltChangeOutputs journals a melt request's NUT-08 blank outputs
+// for the quote — replace-all in one transaction, so a retried melt with
+// the same outputs is idempotent and one with fresh outputs replaces the
+// stale set.
+func (sqlite *SQLiteDB) SaveMeltChangeOutputs(quoteId string, outputs cashu.BlindedMessages) error {
+	tx, err := sqlite.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec("DELETE FROM melt_change_outputs WHERE quote_id = ?", quoteId); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	stmt, err := tx.Prepare("INSERT INTO melt_change_outputs (quote_id, output_index, b_, keyset_id) VALUES (?, ?, ?, ?)")
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+
+	for i, output := range outputs {
+		if _, err := stmt.Exec(quoteId, i, output.B_, output.Id); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetMeltChangeOutputs returns the journaled blank outputs for the quote
+// in request order (amounts are rebuilt as 0: NUT-08 blanks are sent with
+// amount 0 and the mint imprints the change amounts itself at signing
+// time). A quote with no journaled outputs returns an empty slice.
+func (sqlite *SQLiteDB) GetMeltChangeOutputs(quoteId string) (cashu.BlindedMessages, error) {
+	rows, err := sqlite.db.Query(
+		"SELECT b_, keyset_id FROM melt_change_outputs WHERE quote_id = ? ORDER BY output_index", quoteId)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	outputs := cashu.BlindedMessages{}
+	for rows.Next() {
+		var output cashu.BlindedMessage
+		if err := rows.Scan(&output.B_, &output.Id); err != nil {
+			return nil, err
+		}
+		output.Amount = 0
+		outputs = append(outputs, output)
+	}
+	return outputs, rows.Err()
+}
+
 func (sqlite *SQLiteDB) GetIssuedEcash() (map[string]uint64, error) {
 	ecashIssued := make(map[string]uint64)
 

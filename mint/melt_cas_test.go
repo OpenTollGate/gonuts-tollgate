@@ -110,7 +110,7 @@ func runConcurrentMelts(t *testing.T, m *mint.Mint, inputsByAttempt []cashu.Proo
 		go func() {
 			defer wg.Done()
 			<-start
-			_, err := m.MeltTokens(ctx, nut05.PostMeltBolt11Request{
+			_, _, err := m.MeltTokens(ctx, nut05.PostMeltBolt11Request{
 				Quote:  quote.Id,
 				Inputs: inputs,
 			})
@@ -219,7 +219,7 @@ func TestMeltQuoteSequentialDoubleMelt(t *testing.T) {
 	quote := raceTestMeltQuote(t, m, backend, amount)
 	proofs := raceTestProofs(t, m, amount)
 
-	if _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+	if _, _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
 		Quote:  quote.Id,
 		Inputs: proofs,
 	}); err != nil {
@@ -227,7 +227,7 @@ func TestMeltQuoteSequentialDoubleMelt(t *testing.T) {
 	}
 
 	secondProofs := raceTestProofs(t, m, amount)
-	_, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+	_, _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
 		Quote:  quote.Id,
 		Inputs: secondProofs,
 	})
@@ -302,7 +302,7 @@ func TestSigAllSpecConstructionMeltAndSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+	if _, _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
 		Quote:   quote.Id,
 		Inputs:  signed,
 		Outputs: outputs,
@@ -324,7 +324,7 @@ func TestSigAllSpecConstructionMeltAndSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+	if _, _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
 		Quote:   quote2.Id,
 		Inputs:  badSigned,
 		Outputs: outputs,
@@ -435,7 +435,7 @@ func TestSigAllHTLCSpecConstructionMeltAndSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+	if _, _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
 		Quote:   quote.Id,
 		Inputs:  signed,
 		Outputs: outputs,
@@ -459,7 +459,7 @@ func TestSigAllHTLCSpecConstructionMeltAndSwap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
+	if _, _, err := m.MeltTokens(context.Background(), nut05.PostMeltBolt11Request{
 		Quote:   quote2.Id,
 		Inputs:  badSigned,
 		Outputs: outputs,

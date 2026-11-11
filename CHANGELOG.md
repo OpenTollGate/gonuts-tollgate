@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- NUT-08 melt change (cashu-audit #68 B3): the mint returns overpaid fee
+  reserve as change — blank outputs are validated before the quote claim,
+  journaled durably before the payment attempt, and on settlement the
+  overpay (`inputs − input fees − invoice amount − fee actually spent`)
+  is split into keyset denominations, imprinted on the blank outputs in
+  request order, signed with DLEQ and persisted BEFORE the Paid write
+  (the #59 discipline — every crash point leaves the change recoverable).
+  The poll-path reconciler signs change the same way from the journal; a
+  PAID quote re-POSTed with the identical outputs answers idempotently
+  from the stored signatures (works past the NUT-19 cache TTL and across
+  restarts); melt-quote state responses carry the stored change; info
+  declares NUT-08 supported. Backends report the fee actually spent via
+  the new `PaymentStatus.FeeSpent`/`FeeSpentKnown` (CLN wires
+  amount_sent−amount; a backend that cannot report keeps its reserve —
+  never returned on a guess); FakeBackend grows a `FeeReserveSats` knob
+  (default 0) and `cmd/mint` a `MINT_FAKE_FEE_RESERVE` env.
+
+### Fixed
+- The wallet consumes NUT-08 change with the binding disciplines intact:
+  mint-assigned amounts are legal only at the NUT-08 boundary
+  (`constructMeltChangeProofs` — signature i answers blank output i at
+  the same keyset, no more signatures than blanks, keyset denominations
+  only, total bounded by the wallet's own overpay; DLEQ verified) — the
+  swap-response binding (#38) had made every real change answer fail
+  after the invoice was already paid. Melt crash-recovery itself is
+  ceded to #46 (GET-first + NUT-09 recovery per cashu-audit #67 §10–11);
+  this PR carries only the live-path change consumption.
+- Melt blank-output amounts are ignored per NUT-08 ("Bob MUST ignore
+  it, imprinting the amount himself") — wallets legitimately send
+  nonzero amounts there and the reference families accept them.
+
 ### Fixed
 - Melt-quote double-settlement: atomic UNPAID→PENDING CAS before payment
   (two concurrent melts on one quote both paid); failure paths roll the
