@@ -14,7 +14,65 @@ import (
 
 var (
 	ErrCollidingKeysetId = errors.New("error: colliding keyset detected")
+	// ErrHardenedDomainExhausted reports a refusal to derive from, or
+	// allocate, a counter span at or past the end of the NUT-13 hardened
+	// derivation domain. Wrap it with %w so callers can errors.Is it.
+	ErrHardenedDomainExhausted = errors.New("error: hardened derivation counter domain exhausted")
 )
+
+// HardenedCounterLimit is one past the last counter valid for NUT-13
+// hardened derivation. The wallet derivation path index is
+// HardenedKeyStart + counter: at counter == HardenedCounterLimit the
+// uint32 index wraps out of the hardened range onto non-hardened paths,
+// and a persisted storage counter that wrapped past MaxUint32 re-derives
+// secrets the mint has already seen. Valid derivation counters are
+// therefore confined to [0, HardenedCounterLimit).
+//
+// HardenedCounterLimit itself is a valid STORED counter value — the
+// documented one-past-end "exhausted" marker a reservation may land on
+// after deriving the last valid index — but nothing may ever be derived
+// from it or allocated past it.
+const HardenedCounterLimit uint32 = hdkeychain.HardenedKeyStart
+
+// CheckHardenedCounterSpan is the single checked domain/range authority
+// shared by NUT-13 derivation, wallet output allocation and storage
+// counter reservation. It validates that the half-open span
+// [start, start+num) lies entirely within the hardened domain, using
+// wide (uint64) arithmetic so neither the count nor the resulting end
+// can truncate or wrap.
+//
+// A zero-length span derives nothing and moves no counter, so it is
+// always allowed — preserving existing zero-output operations (empty
+// NUT-08 change melts) — including on the exhausted marker or a legacy
+// out-of-domain record, which are preserved, never clamped or reset.
+//
+// The span's exclusive end may land exactly on HardenedCounterLimit:
+// that reserves the last valid hardened index and stores the exhausted
+// marker. Any further non-zero allocation from there is refused.
+func CheckHardenedCounterSpan(start uint32, num uint64) error {
+	if num == 0 {
+		return nil
+	}
+	if start >= HardenedCounterLimit {
+		return fmt.Errorf("%w: counter %d is at or past the hardened domain limit %d", ErrHardenedDomainExhausted, start, HardenedCounterLimit)
+	}
+	// Compare the count to remaining capacity before adding: num itself
+	// may be MaxUint64, so widening start alone cannot prevent overflow.
+	if num > uint64(HardenedCounterLimit)-uint64(start) {
+		return fmt.Errorf("%w: span starting at %d with %d outputs exceeds the hardened domain limit %d", ErrHardenedDomainExhausted, start, num, HardenedCounterLimit)
+	}
+	return nil
+}
+
+// checkHardenedCounter is the innermost derivation guard: a single
+// counter at or past the domain limit — including the one-past-end
+// exhausted marker — must never be derived.
+func checkHardenedCounter(counter uint32) error {
+	if counter >= HardenedCounterLimit {
+		return fmt.Errorf("%w: refusing to derive counter %d at or past the hardened domain limit %d", ErrHardenedDomainExhausted, counter, HardenedCounterLimit)
+	}
+	return nil
+}
 
 // NUT #13: This value is then modulo reduced by `2^31 - 1` to arrive at an integer that is a unique identifier `keyset_id_int`.
 func keysetIdToBigInt(id string) (*big.Int, error) {
@@ -70,6 +128,10 @@ func DeriveKeysetPath(master *hdkeychain.ExtendedKey, keysetId string) (*hdkeych
 
 // NUT #13: Here, we describe how wallets can deterministically generate the `secrets` and blinding factors `r` necessary to generate the signatures `C`.
 func DeriveBlindingFactor(keysetPath *hdkeychain.ExtendedKey, counter uint32) (*secp256k1.PrivateKey, error) {
+	if err := checkHardenedCounter(counter); err != nil {
+		return nil, err
+	}
+
 	// m/129372'/0'/keyset_k_int'/counter'
 	counterPath, err := keysetPath.Derive(hdkeychain.HardenedKeyStart + counter)
 	if err != nil {
@@ -92,6 +154,10 @@ func DeriveBlindingFactor(keysetPath *hdkeychain.ExtendedKey, counter uint32) (*
 
 // NUT #13: The wallet uses the `seed`, to derive deterministic values for the `secret` and the blinding factors `r` for every new ecash token that it generates.
 func DeriveSecret(keysetPath *hdkeychain.ExtendedKey, counter uint32) (string, error) {
+	if err := checkHardenedCounter(counter); err != nil {
+		return "", err
+	}
+
 	// m/129372'/0'/keyset_k_int'/counter'
 	counterPath, err := keysetPath.Derive(hdkeychain.HardenedKeyStart + counter)
 	if err != nil {

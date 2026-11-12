@@ -690,6 +690,16 @@ func (db *BoltDB) IncrementKeysetCounter(keysetId string, num uint32) error {
 				if err != nil {
 					return fmt.Errorf("error reading keyset from db: %v", err)
 				}
+				keysetFound = true
+				// Checked range authority, inside the transaction and
+				// before any write: a span that would leave the hardened
+				// derivation domain (or wrap the uint32 counter) is
+				// refused, rolling back with the counter untouched.
+				// Legacy out-of-domain records are preserved as-is —
+				// refused, never clamped or reset.
+				if err := nut13.CheckHardenedCounterSpan(keyset.Counter, uint64(num)); err != nil {
+					return fmt.Errorf("refusing to advance keyset %s counter %d by %d: %w", keysetId, keyset.Counter, num, err)
+				}
 				keyset.Counter += num
 
 				jsonBytes, err := json.Marshal(keyset)
@@ -736,6 +746,15 @@ func (db *BoltDB) ReserveKeysetRangeWithIntent(keysetId string, num uint32, inte
 				err := json.Unmarshal(keysetBytes, &keyset)
 				if err != nil {
 					return fmt.Errorf("error reading keyset from db: %v", err)
+				}
+				keysetFound = true
+				// Checked range authority, inside the transaction and
+				// before either the counter or the intent write: a span
+				// that would leave the hardened derivation domain (or
+				// wrap the uint32 counter) is refused atomically —
+				// neither the counter nor the intent row is written.
+				if err := nut13.CheckHardenedCounterSpan(keyset.Counter, uint64(num)); err != nil {
+					return fmt.Errorf("refusing to reserve %d outputs for keyset %s at counter %d: %w", num, keysetId, keyset.Counter, err)
 				}
 				keyset.Counter += num
 
