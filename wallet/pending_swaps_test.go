@@ -25,17 +25,21 @@ import (
 // DhKE), so the resume path can be exercised end to end offline. It
 // keeps the private keys the wallet never sees.
 type signingMint struct {
-	t               *testing.T
-	server          *httptest.Server
-	privs           map[uint64]*secp256k1.PrivateKey
-	keyset          crypto.WalletKeyset
-	swaps           int
-	mints           int
-	melts           int
-	lastReq         []byte
-	lastQuoteID     string
-	lastMeltReq     cashu.BlindedMessages
-	meltChangeCache map[string][]cashu.BlindedSignature
+	t                  *testing.T
+	server             *httptest.Server
+	privs              map[uint64]*secp256k1.PrivateKey
+	keyset             crypto.WalletKeyset
+	swaps              int
+	mints              int
+	melts              int
+	lastReq            []byte
+	lastQuoteID        string
+	lastMeltReq        cashu.BlindedMessages
+	meltChangeCache    map[string][]cashu.BlindedSignature
+	meltQuoteState     string
+	meltQuoteHTTPError bool
+	omitMeltChange     bool
+	zeroMeltChange     bool
 	// refusal, when non-nil, makes /v1/swap answer with this mint error
 	// instead of signing — the beyond-window replay shape (cdk-mintd
 	// emits {"code":11001,"detail":"Token Already Spent"} once its
@@ -132,11 +136,27 @@ func newSigningMint(t *testing.T) *signingMint {
 	})
 	mux.HandleFunc("/v1/melt/quote/bolt11/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
+			if m.meltQuoteHTTPError {
+				http.Error(w, "quote unavailable", http.StatusBadRequest)
+				return
+			}
 			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 			id := parts[len(parts)-1]
+			state := "UNPAID"
+			var change []cashu.BlindedSignature
+			if m.melts > 0 {
+				state = "PAID"
+				change = m.meltChangeCache[string(mustMarshalForMeltKey(m.lastMeltReq))]
+			}
+			if m.meltQuoteState != "" {
+				state = m.meltQuoteState
+			}
+			if m.omitMeltChange {
+				change = nil
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"quote": id, "request": fakeMeltInvoice, "amount": 21, "unit": "sat",
-				"fee_reserve": 1, "state": "UNPAID", "expiry": 0, "updated_at": 0,
+				"fee_reserve": 1, "state": state, "change": change, "expiry": 0, "updated_at": 0,
 			})
 			return
 		}
@@ -165,6 +185,9 @@ func newSigningMint(t *testing.T) *signingMint {
 		if !seen {
 			sigs = []cashu.BlindedSignature{}
 			for _, out := range req.Outputs {
+				if m.zeroMeltChange {
+					break
+				}
 				B_, err := hex.DecodeString(out.B_)
 				if err != nil {
 					http.Error(w, "bad B_", 400)
@@ -175,12 +198,17 @@ func newSigningMint(t *testing.T) *signingMint {
 					http.Error(w, "bad point", 400)
 					return
 				}
-				C_ := crypto.SignBlindedMessage(BPub, m.privs[out.Amount])
+				amount := out.Amount
+				if amount == 0 {
+					amount = 1
+				} // NUT-08 assigns a positive value to a blank.
+				C_ := crypto.SignBlindedMessage(BPub, m.privs[amount])
 				sigs = append(sigs, cashu.BlindedSignature{
-					Amount: out.Amount,
+					Amount: amount,
 					Id:     m.keyset.Id,
 					C_:     hex.EncodeToString(C_.SerializeCompressed()),
 				})
+				m.signed[out.B_] = sigs[len(sigs)-1]
 			}
 			m.meltChangeCache[key] = sigs
 		}
@@ -615,13 +643,17 @@ func TestResumePendingOperationsRecoversCrashedMelt(t *testing.T) {
 	if err != nil || failed != 0 {
 		t.Fatalf("resume: recovered=%d failed=%d err=%v", recovered, failed, err)
 	}
-	if m.melts != 2 {
-		t.Fatalf("mint should have signed the melt exactly twice (original + replay), signed %d", m.melts)
+	if m.melts != 1 {
+		t.Fatalf("paid melt must recover by GET without another POST; got %d melt POSTs", m.melts)
 	}
-	if w.GetBalance() != balanceBefore-uint64(meltQuote.Amount+meltQuote.FeeReserve) {
-		// balance after = inputs consumed, change recovered
-		t.Logf("balance before=%d after resume=%d (melt amount=%d fee=%d)",
-			balanceBefore, w.GetBalance(), meltQuote.Amount, meltQuote.FeeReserve)
+	if recovered != 1 || w.GetBalance() != balanceBefore-uint64(meltQuote.Amount+meltQuote.FeeReserve)+1 {
+		t.Fatalf("fee change not recovered: recovered=%d before=%d after=%d", recovered, balanceBefore, w.GetBalance())
+	}
+	if w.PendingBalance() != 0 {
+		t.Fatal("settled melt inputs remain pending")
+	}
+	if got, failed, err := w.ResumePendingOperations(); got != 0 || failed != 0 || err != nil {
+		t.Fatalf("repeat resume changed state: %d %d %v", got, failed, err)
 	}
 	remaining := 0
 	for _, i := range w.db.GetPendingSwaps() {
