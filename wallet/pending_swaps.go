@@ -2,19 +2,23 @@ package wallet
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/OpenTollGate/gonuts-tollgate/cashu"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut03"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut07"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut09"
+	"github.com/OpenTollGate/gonuts-tollgate/crypto"
 	"github.com/OpenTollGate/gonuts-tollgate/wallet/client"
 	"github.com/OpenTollGate/gonuts-tollgate/wallet/storage"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -198,7 +202,7 @@ func (w *Wallet) resumeOneSwap(intent *storage.PendingSwapIntent) (uint64, error
 		if isProofsAlreadySpentRefusal(body) {
 			return w.resumeSwapViaRestore(intent)
 		}
-		return 0, fmt.Errorf("mint answered replay with HTTP %d: %s", resp.StatusCode, truncateForLog(body, 200))
+		return w.resolveRejectedSwapByCheckstate(intent, resp.StatusCode, body)
 	}
 
 	var swapResponse nut03.PostSwapResponse
@@ -388,4 +392,101 @@ func mustMarshalMintRequest(req nut04.PostMintBolt11Request) []byte {
 		panic(fmt.Sprintf("marshal mint request: %v", err))
 	}
 	return b
+}
+
+// isOutputsSignedRefusal reports whether the mint's rejection says the
+// OUTPUTS of this request were already signed — the duplicate-output
+// family: current error_codes.md 11008 ("Duplicate outputs provided"),
+// the pre-2025-04 spelling 10002, and the mint-shape 0 with the words in
+// the detail ( Coinos-family mints answer
+// {"code":0,"detail":"... outputs ... already signed/duplicate ..."}).
+// NOTE: spec error_codes.md numbers "Outputs already signed" as 11003 for
+// NUT-03; this fork's cashu.go currently labels 11003 as the
+// payment-method error, so 11003 is deliberately NOT matched here until
+// that mapping is reconciled against the spec.
+func isOutputsSignedRefusal(body []byte) bool {
+	var mintErr cashu.Error
+	if err := json.Unmarshal(body, &mintErr); err != nil {
+		return false
+	}
+	if mintErr.Code == cashu.DuplicateOutputErrCode || mintErr.Code == 10002 {
+		return true
+	}
+	detail := strings.ToLower(mintErr.Detail)
+	return mintErr.Code == 0 && strings.Contains(detail, "outputs") &&
+		(strings.Contains(detail, "already signed") || strings.Contains(detail, "duplicate"))
+}
+
+// resolveRejectedSwapByCheckstate is the ladder for a swap replay the mint
+// REJECTED (tollgate #1237): do not guess from error codes — ask the mint
+// about the INPUTS and let its proof state decide.
+//
+//	all inputs SPENT    → the swap executed; its outputs were signed →
+//	                     recover them via the existing NUT-09 restore path.
+//	all inputs UNSPENT  → the swap provably never landed → compensate:
+//	                     release the input reservation and retire the
+//	                     intent. The derivation range is NOT rewound — it
+//	                     was exposed to the mint once, and counters are
+//	                     monotonic (#266/#495).
+//	outputs-signed rejection + inputs UNSPENT → torn mint state (signed
+//	                     outputs with unconsumed inputs) — keep journaled.
+//	mixed / PENDING / checkstate failure → keep journaled (retry pass or
+//	                     operator); never guess.
+func (w *Wallet) resolveRejectedSwapByCheckstate(intent *storage.PendingSwapIntent, status int, body []byte) (uint64, error) {
+	rejected := fmt.Errorf("mint answered replay with HTTP %d: %s", status, truncateForLog(body, 200))
+	var req nut03.PostSwapRequest
+	if err := json.Unmarshal(intent.RequestBytes, &req); err != nil {
+		return 0, fmt.Errorf("%w; journaled request no longer parses: %v", rejected, err)
+	}
+	if len(req.Inputs) == 0 {
+		return 0, fmt.Errorf("%w; journaled request has no inputs to checkstate — keeping intent %s journaled", rejected, intent.OpID)
+	}
+	ys := make([]string, 0, len(req.Inputs))
+	for _, proof := range req.Inputs {
+		Y, err := crypto.HashToCurve([]byte(proof.Secret))
+		if err != nil {
+			return 0, fmt.Errorf("%w; cannot derive Y for a journaled input — keeping intent %s journaled: %v", rejected, intent.OpID, err)
+		}
+		ys = append(ys, hex.EncodeToString(Y.SerializeCompressed()))
+	}
+	state, err := client.PostCheckProofState(intent.MintURL, nut07.PostCheckStateRequest{Ys: ys})
+	if err != nil {
+		return 0, fmt.Errorf("%w; checkstate failed — keeping intent %s journaled: %v", rejected, intent.OpID, err)
+	}
+	spent, unspent := 0, 0
+	for _, s := range state.States {
+		switch s.State {
+		case nut07.Spent:
+			spent++
+		case nut07.Unspent:
+			unspent++
+		}
+	}
+	switch {
+	case spent == len(ys):
+		// The mint consumed the inputs: the swap executed and these
+		// outputs were signed — recover them exactly as the 11001 path
+		// does (B_-aligned restore, malformed-shape refusal).
+		return w.resumeSwapViaRestore(intent)
+	case unspent == len(ys):
+		if isOutputsSignedRefusal(body) {
+			return 0, fmt.Errorf(
+				"%w; torn mint state: outputs reported already-signed but every input is UNSPENT — keeping intent %s journaled",
+				rejected, intent.OpID)
+		}
+		// The swap never landed and nothing was signed: the reservation is
+		// provably unconsumed. Release the pending marks and retire the
+		// intent. The derivation range stays advanced (exposed once,
+		// counters are monotonic).
+		if err := w.db.DeletePendingProofs(ys); err != nil {
+			return 0, fmt.Errorf("%w; inputs UNSPENT but reservation release failed — keeping intent %s journaled: %v", rejected, intent.OpID, err)
+		}
+		if err := w.db.DeletePendingSwap(intent.OpID); err != nil {
+			return 0, fmt.Errorf("%w; reservation released but intent %s not deleted: %v", rejected, intent.OpID, err)
+		}
+		log.Printf("wallet: pending swap %s compensated (replay rejected, all inputs UNSPENT); derivation range not rewound", intent.OpID)
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("%w; mixed/pending input states (%d spent, %d unspent, %d total) — keeping intent %s journaled", rejected, spent, unspent, len(ys), intent.OpID)
+	}
 }

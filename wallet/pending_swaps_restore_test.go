@@ -180,10 +180,14 @@ func TestResumeKeepsIntentWhenRestoreTransportFails(t *testing.T) {
 	}
 }
 
-// Only the 11001 spent-refusal arms the restore fallback: other mint
-// errors keep the plain not-recoverable-this-pass behavior and never hit
-// /v1/restore.
-func TestResumeDoesNotRestoreOnNonSpentRefusal(t *testing.T) {
+// A refusal that is NOT the 11001 spent-refusal no longer pins the intent
+// to the error-code guess: the ladder asks the mint about the INPUTS
+// (tollgate #1237). With the inputs provably SPENT the swap executed, so
+// the outputs exist as signatures and the NUT-09 restore recovers them —
+// regardless of which error code the mint wrapped the rejection in.
+// (Pre-ladder behavior this test replaced: any non-11001 refusal kept the
+// intent journaled forever, stranding value the mint had already taken.)
+func TestResumeArmsRestoreFromMintStateNotErrorCode(t *testing.T) {
 	m := newSigningMint(t)
 	w, err := LoadWallet(Config{WalletPath: t.TempDir(), CurrentMintURL: m.server.URL})
 	if err != nil {
@@ -198,14 +202,17 @@ func TestResumeDoesNotRestoreOnNonSpentRefusal(t *testing.T) {
 	m.refusal = cashu.BuildCashuError("proof verification failed", cashu.CashuErrCode(10001))
 
 	recovered, failed, _ := w.ResumePendingSwaps()
-	if recovered != 0 || failed != 1 {
-		t.Fatalf("recovered=%d failed=%d, want 0 and 1", recovered, failed)
+	if recovered != 16 || failed != 0 {
+		t.Fatalf("recovered=%d failed=%d, want 16 and 0 (checkstate SPENT arms restore)", recovered, failed)
 	}
-	if m.restoreCalls != 0 {
-		t.Fatalf("restore called %d times, want 0 — only 11001 arms the fallback", m.restoreCalls)
+	if m.checkstateCalls < 1 {
+		t.Fatal("the ladder must consult checkstate before restoring")
 	}
-	if len(w.db.GetPendingSwaps()) != 1 {
-		t.Fatal("intent must survive a non-spent refusal")
+	if m.restoreCalls != 1 {
+		t.Fatalf("restore called %d times, want 1", m.restoreCalls)
+	}
+	if len(w.db.GetPendingSwaps()) != 0 {
+		t.Fatal("intent must retire after state-armed restore")
 	}
 }
 
@@ -371,16 +378,19 @@ func TestResumeMixedOutcomesAcrossIntents(t *testing.T) {
 	}
 
 	recovered, failed, err := w.ResumePendingSwaps()
-	if err != nil || failed != 1 || recovered != 24 {
-		t.Fatalf("resume: recovered=%d failed=%d err=%v, want 24/1/nil", recovered, failed, err)
+	// The #1237 ladder classifies by mint state, not error codes: the
+	// 10001-refused intent's inputs are SPENT (its POST landed before the
+	// crash), so it recovers via restore too — all three intents settle.
+	if err != nil || failed != 0 || recovered != 28 {
+		t.Fatalf("resume: recovered=%d failed=%d err=%v, want 28/0/nil (16 restored + 8 replayed + 4 state-armed restore)", recovered, failed, err)
 	}
-	if w.GetBalance() != 24 {
-		t.Fatalf("balance = %d, want 24 (16 restored + 8 replayed)", w.GetBalance())
+	if w.GetBalance() != 28 {
+		t.Fatalf("balance = %d, want 28", w.GetBalance())
 	}
-	if remaining := len(w.db.GetPendingSwaps()); remaining != 1 {
-		t.Fatalf("%d intents remaining, want exactly the non-11001 one", remaining)
+	if remaining := len(w.db.GetPendingSwaps()); remaining != 0 {
+		t.Fatalf("%d intents remaining, want 0 — the ladder settles all of them", remaining)
 	}
-	if m.restoreCalls != 1 {
-		t.Fatalf("restore called %d times, want 1 — only the 11001 refusal arms it", m.restoreCalls)
+	if m.restoreCalls != 2 {
+		t.Fatalf("restore called %d times, want 2 (the 11001 path + the state-armed path)", m.restoreCalls)
 	}
 }
