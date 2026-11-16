@@ -140,11 +140,26 @@ func (w *Wallet) resumeOneMint(intent *storage.PendingSwapIntent) (uint64, error
 	return w.finishResume(intent, mintResponse.Signatures)
 }
 
-// resumeOneMelt replays a /v1/melt/bolt11 request. cdk-mintd replays
-// melts idempotently — a paid quote re-POSTed with identical bytes
-// returns state PAID with the same change signatures (verified live) —
-// so the persisted factors recover the change exactly as in swaps.
+// resumeOneMelt checks settlement before recovering journaled NUT-08 change.
+// Paid quotes are never melted again; pending quotes remain journaled. Only
+// an unpaid quote uses the existing idempotent replay path.
 func (w *Wallet) resumeOneMelt(intent *storage.PendingSwapIntent) (uint64, error) {
+	var request nut05.PostMeltBolt11Request
+	if err := json.Unmarshal(intent.RequestBytes, &request); err != nil {
+		return 0, err
+	}
+	// A paid quote already carries its NUT-08 change. Recover it with a GET;
+	// a mint need not accept another melt POST after Lightning settlement.
+	state, err := client.GetMeltQuoteState(intent.MintURL, request.Quote)
+	if err != nil {
+		return 0, err
+	}
+	if state.State == nut05.Paid {
+		return w.finishMeltResume(intent, request.Quote, state)
+	}
+	if state.State == nut05.Pending {
+		return 0, errors.New("melt remains pending; leave intent for reconciliation")
+	}
 	url := intent.MintURL
 	if len(url) == 0 || url[len(url)-1] != '/' {
 		url += "/"
@@ -168,16 +183,59 @@ func (w *Wallet) resumeOneMelt(intent *storage.PendingSwapIntent) (uint64, error
 	if meltResponse.State != nut05.Paid {
 		return 0, fmt.Errorf("melt replay state %v, not PAID", meltResponse.State)
 	}
-	// The change signatures are the recovery target; an empty change
-	// (no fee overpayment) carries no value, so success with nothing to
-	// unblind is a clean completion.
-	if len(meltResponse.Change) == 0 {
-		if err := w.db.DeletePendingSwap(intent.OpID); err != nil {
-			return 0, fmt.Errorf("melt recovered (no change) but intent %s not deleted: %w", intent.OpID, err)
-		}
-		return 0, nil
+	return w.finishMeltResume(intent, request.Quote, &meltResponse)
+}
+
+func (w *Wallet) finishMeltResume(intent *storage.PendingSwapIntent, quoteID string, response *nut05.PostMeltQuoteBolt11Response) (uint64, error) {
+	quote := w.db.GetMeltQuoteById(quoteID)
+	if quote == nil {
+		return 0, ErrQuoteNotFound
 	}
-	return w.finishResume(intent, meltResponse.Change)
+	quote.State = nut05.Paid
+	quote.Preimage = response.Preimage
+	if quote.SettledAt == 0 {
+		quote.SettledAt = time.Now().Unix()
+	}
+	if err := w.db.SaveMeltQuote(*quote); err != nil {
+		return 0, err
+	}
+	if response.Change == nil && len(intent.Outputs) > 0 {
+		// A quote GET may omit change even though the original melt signed
+		// some outputs. Absence is not evidence of zero change: ask NUT-09
+		// for the exact journaled B_ values before retiring the intent.
+		return w.resumeMeltChangeViaRestore(intent)
+	}
+	return w.finishResume(intent, response.Change)
+}
+
+func (w *Wallet) resumeMeltChangeViaRestore(intent *storage.PendingSwapIntent) (uint64, error) {
+	response, err := postRestore(intent.MintURL, nut09.PostRestoreRequest{Outputs: intent.Outputs})
+	if err != nil {
+		return 0, fmt.Errorf("paid quote omitted change; NUT-09 recovery failed: %w", err)
+	}
+	if len(response.Outputs) != len(response.Signatures) || len(response.Outputs) > len(intent.Outputs) {
+		return 0, errors.New("malformed NUT-09 melt change response; keeping intent journaled")
+	}
+	index := make(map[string]int, len(intent.Outputs))
+	for i, output := range intent.Outputs {
+		index[output.B_] = i
+	}
+	factors := intentBlindingFactors(intent)
+	messages := make(cashu.BlindedMessages, len(response.Outputs))
+	secrets := make([]string, len(response.Outputs))
+	rs := make([]*secp256k1.PrivateKey, len(response.Outputs))
+	seen := make(map[string]bool, len(response.Outputs))
+	for i, output := range response.Outputs {
+		j, ok := index[output.B_]
+		if !ok || seen[output.B_] {
+			return 0, errors.New("NUT-09 melt change returned an unknown or duplicate output; keeping intent journaled")
+		}
+		seen[output.B_] = true
+		messages[i], secrets[i], rs[i] = intent.Outputs[j], intent.Secrets[j], factors[j]
+	}
+	// Unlike a swap, a melt need not sign every blank output. An empty
+	// restore is a valid zero-change result for a confirmed paid quote.
+	return w.finishRecoveredSwap(intent, response.Signatures, messages, secrets, rs, " via NUT-09 melt change restore")
 }
 
 func (w *Wallet) resumeOneSwap(intent *storage.PendingSwapIntent) (uint64, error) {
@@ -283,7 +341,11 @@ func (w *Wallet) finishRecoveredSwap(
 		return 0, fmt.Errorf("keyset %s no longer in wallet db (rotated away?)", intent.KeysetID)
 	}
 
-	proofs, err := constructProofs(signatures, messages, secrets, rs, keyset)
+	construct := constructProofs
+	if intent.OpType == storage.PendingOpMelt {
+		construct = constructMeltChangeProofs
+	}
+	proofs, err := construct(signatures, messages, secrets, rs, keyset)
 	if err != nil {
 		return 0, fmt.Errorf("could not unblind replayed signatures: %w", err)
 	}
@@ -303,6 +365,15 @@ func (w *Wallet) finishRecoveredSwap(
 		}
 	}
 
+	if intent.OpType == storage.PendingOpMelt {
+		var melt nut05.PostMeltBolt11Request
+		if err := json.Unmarshal(intent.RequestBytes, &melt); err != nil {
+			return 0, err
+		}
+		if err := w.db.DeletePendingProofsByQuoteId(melt.Quote); err != nil {
+			return 0, err
+		}
+	}
 	if err := w.db.DeletePendingSwap(intent.OpID); err != nil {
 		return 0, fmt.Errorf("proofs stored but intent %s not deleted: %w", intent.OpID, err)
 	}

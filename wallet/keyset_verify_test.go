@@ -49,7 +49,7 @@ func TestVerifyKeysetIdRejectsForgedV1(t *testing.T) {
 	}
 	forged := id[:15] + string(flip)
 	if forged == id {
-		t.Fatal("fixture must actually differ from the derived ID")
+		forged = id[:15] + "e"
 	}
 	err := verifyKeysetId(forged, keys, "sat", 0)
 	if err == nil {
