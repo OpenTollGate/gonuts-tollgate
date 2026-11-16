@@ -1,7 +1,9 @@
 package wallet
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"strings"
@@ -12,6 +14,15 @@ import (
 func isNetworkError(err error) bool {
 	if err == nil {
 		return false
+	}
+
+	// A connection that is accepted and then closed without a response
+	// surfaces as EOF. This is the common "mint process is down / crashed /
+	// mid-restart" failure, and it must be treated like any other transport
+	// failure: callers such as loadWalletMints skip the keyset and keep its
+	// DB record (and proofs) instead of aborting the whole wallet.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
 	}
 
 	errStr := err.Error()
@@ -27,6 +38,10 @@ func isNetworkError(err error) bool {
 		"server misbehaving",
 		"dial tcp",
 		"lookup",
+		"eof",
+		"unexpected eof",
+		"connection closed",
+		"http2: client connection lost",
 	}
 
 	for _, netErr := range networkErrors {
@@ -35,14 +50,18 @@ func isNetworkError(err error) bool {
 		}
 	}
 
-	// Check for specific network error types
-	if _, ok := err.(net.Error); ok {
+	// Check for specific network error types. Use errors.As so wrapped errors
+	// (fmt.Errorf("...: %w", err)) are classified correctly.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
 		return true
 	}
-	if _, ok := err.(*net.OpError); ok {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
 		return true
 	}
-	if _, ok := err.(*url.Error); ok {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
 		return true
 	}
 
