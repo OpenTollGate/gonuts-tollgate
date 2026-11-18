@@ -468,10 +468,9 @@ func (w *Wallet) MintTokens(quoteId string) (uint64, error) {
 		log.Printf("wallet: could not delete mint intent %s after save: %v", opID, err)
 	}
 
-	// only increase counter if mint was successful
-	if err := w.db.IncrementKeysetCounter(activeKeyset.Id, uint32(len(blindedMessages))); err != nil {
-		return 0, fmt.Errorf("error incrementing keyset counter: %w", err)
-	}
+	// The whole output range was reserved before the POST. Advancing it
+	// again would double-count the range and could report failure after
+	// proofs are saved when the first reservation ends at the domain limit.
 
 	quote.State = nut04.Issued
 	quote.SettledAt = time.Now().Unix()
@@ -2071,6 +2070,19 @@ func (w *Wallet) createBlindedMessages(
 	blindedMessages := make(cashu.BlindedMessages, splitLen)
 	secrets := make([]string, splitLen)
 	rs := make([]*secp256k1.PrivateKey, splitLen)
+
+	// Checked allocation span, BEFORE any output is generated or
+	// exposed: the whole requested range [counter, counter+len) must lie
+	// inside the NUT-13 hardened domain. A refusal here means no blinded
+	// message, secret or blinding factor for this operation is ever
+	// created — nothing to expose, nothing to roll back. Zero-length
+	// spans (existing zero-output behavior) and nil counters (random
+	// secrets) are unaffected.
+	if counter != nil {
+		if err := nut13.CheckHardenedCounterSpan(*counter, uint64(splitLen)); err != nil {
+			return nil, nil, nil, fmt.Errorf("refusing to derive %d deterministic outputs for keyset %s: %w", splitLen, keysetId, err)
+		}
+	}
 
 	keysetDerivationPath, err := nut13.DeriveKeysetPath(w.masterKey, keysetId)
 	if err != nil {
