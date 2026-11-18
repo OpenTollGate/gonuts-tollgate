@@ -16,6 +16,7 @@ import (
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut03"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut04"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut05"
+	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut07"
 	"github.com/OpenTollGate/gonuts-tollgate/cashu/nuts/nut09"
 	"github.com/OpenTollGate/gonuts-tollgate/crypto"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
@@ -54,15 +55,23 @@ type signingMint struct {
 	shuffleRestore bool
 	// signed remembers every output the stub has signed, keyed by B_ —
 	// the /v1/restore memory.
-	signed          map[string]cashu.BlindedSignature
-	restoreCalls    int
-	restoreErr      bool
-	dropLastRestore bool
+	signed map[string]cashu.BlindedSignature
+	// spentInputYs tracks the input proof Ys consumed by processed swaps —
+	// the mint-side truth /v1/checkstate reports (the #1237 ladder).
+	spentInputYs map[string]bool
+	// swapReplayRefusal, when non-nil, is the mint error answered to any
+	// /v1/swap whose inputs are already consumed (a replay) — the
+	// NUT-19-blind mint shape: no response cache, duplicates refused.
+	swapReplayRefusal *cashu.Error
+	checkstateCalls   int
+	restoreCalls      int
+	restoreErr        bool
+	dropLastRestore   bool
 }
 
 func newSigningMint(t *testing.T) *signingMint {
 	t.Helper()
-	m := &signingMint{t: t, privs: map[uint64]*secp256k1.PrivateKey{}, meltChangeCache: map[string][]cashu.BlindedSignature{}, signed: map[string]cashu.BlindedSignature{}}
+	m := &signingMint{t: t, privs: map[uint64]*secp256k1.PrivateKey{}, meltChangeCache: map[string][]cashu.BlindedSignature{}, signed: map[string]cashu.BlindedSignature{}, spentInputYs: map[string]bool{}}
 	pubs := crypto.PublicKeys{}
 	for _, a := range []uint64{0, 1, 2, 4, 8, 16, 32, 64} {
 		h := randPrivKey(t)
@@ -230,6 +239,19 @@ func newSigningMint(t *testing.T) *signingMint {
 		m.swaps++
 		raw, _ := json.Marshal(req)
 		m.lastReq = raw
+		replay := true
+		for _, p := range req.Inputs {
+			Y, _ := crypto.HashToCurve([]byte(p.Secret))
+			if !m.spentInputYs[hex.EncodeToString(Y.SerializeCompressed())] {
+				replay = false
+			}
+		}
+		if len(req.Inputs) > 0 && replay && m.swapReplayRefusal != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(*m.swapReplayRefusal)
+			return
+		}
 		refusal := m.refusal
 		if m.refusalFor != nil {
 			refusal = m.refusalFor(&req)
@@ -261,7 +283,28 @@ func newSigningMint(t *testing.T) *signingMint {
 			m.signed[out.B_] = sig
 			sigs = append(sigs, sig)
 		}
+		for _, p := range req.Inputs {
+			Y, _ := crypto.HashToCurve([]byte(p.Secret))
+			m.spentInputYs[hex.EncodeToString(Y.SerializeCompressed())] = true
+		}
 		_ = json.NewEncoder(w).Encode(nut03.PostSwapResponse{Signatures: sigs})
+	})
+	mux.HandleFunc("/v1/checkstate", func(w http.ResponseWriter, r *http.Request) {
+		m.checkstateCalls++
+		var req nut07.PostCheckStateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		states := make([]nut07.ProofState, 0, len(req.Ys))
+		for _, y := range req.Ys {
+			st := nut07.Unspent
+			if m.spentInputYs[y] {
+				st = nut07.Spent
+			}
+			states = append(states, nut07.ProofState{Y: y, State: st})
+		}
+		_ = json.NewEncoder(w).Encode(nut07.PostCheckStateResponse{States: states})
 	})
 	mux.HandleFunc("/v1/restore", func(w http.ResponseWriter, r *http.Request) {
 		m.restoreCalls++
@@ -663,5 +706,148 @@ func TestResumePendingOperationsRecoversCrashedMelt(t *testing.T) {
 	}
 	if remaining != 0 {
 		t.Fatal("melt intent must be deleted after recovery")
+	}
+}
+
+// TestResumeSwapReplayRejectedLadder (tollgate #1237): a NUT-19-blind mint
+// refuses the reconciliation REPLAY with the duplicate-output error. The
+// ladder must not guess from the error code — it asks the mint about the
+// INPUTS:
+//
+//	spent  -> the swap executed -> recover via NUT-09 restore
+//	unspent + non-outputs-signed rejection -> never landed -> compensate
+//	unspent + outputs-signed rejection -> torn mint -> keep journaled
+func TestResumeSwapReplayRejectedLadder(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		refusal         cashu.Error
+		wantRecovered   uint64
+		wantCompensated bool
+		wantKept        bool
+	}{
+		{
+			name:          "duplicate-outputs inputs spent recovers via restore",
+			refusal:       cashu.Error{Code: cashu.DuplicateOutputErrCode, Detail: "Outputs already signed"},
+			wantRecovered: 64,
+		},
+		{
+			name:          "legacy-10002 inputs spent recovers via restore",
+			refusal:       cashu.Error{Code: 10002, Detail: "Blinded message of output already signed"},
+			wantRecovered: 64,
+		},
+		{
+			name:            "generic refusal inputs unspent compensates",
+			refusal:         cashu.Error{Code: 0, Detail: "keyset 007311aa2fa58cc8 unknown"},
+			wantCompensated: true,
+		},
+		{
+			name:     "outputs-signed refusal with unspent inputs stays journaled",
+			refusal:  cashu.Error{Code: cashu.DuplicateOutputErrCode, Detail: "Outputs already signed"},
+			wantKept: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newSigningMint(t)
+			path := t.TempDir()
+			w, err := LoadWallet(Config{WalletPath: path, CurrentMintURL: m.server.URL})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// For the compensated/torn cases the FIRST POST is also refused
+			// (inputs never consumed): arm the replay refusal from the
+			// start by pre-seeding nothing — instead use refusalFor to
+			// answer the chosen error on the FIRST call too, and the
+			// swapReplayRefusal for replays.
+			if tc.wantCompensated || tc.wantKept {
+				m.refusalFor = func(*nut03.PostSwapRequest) *cashu.Error {
+					e := tc.refusal
+					return &e
+				}
+			}
+
+			origSwap := swap
+			swap = func(mintURL string, req swapRequestPayload) (cashu.Proofs, error) {
+				body, _ := json.Marshal(nut03.PostSwapRequest{Inputs: req.inputs, Outputs: req.outputs})
+				resp, err := http.Post(mintURL+"/v1/swap", "application/json", bytes.NewReader(body))
+				if err != nil {
+					return nil, err
+				}
+				resp.Body.Close()
+				return nil, errSimulatedCrash
+			}
+
+			req := m.newSwapRequest(t, w, 64)
+			_, _, _ = w.swapWithIntent(m.server.URL, req)
+			swap = origSwap
+			if len(w.db.GetPendingSwaps()) != 1 {
+				t.Fatalf("intent must survive, have %d", len(w.db.GetPendingSwaps()))
+			}
+
+			// The crash window persists the reservation: the intent AND
+			// the pending marks survive the process death (the live error
+			// path would roll the marks back — a crash does not).
+			if tc.wantCompensated || tc.wantKept {
+				if err := w.db.AddPendingProofs(req.inputs); err != nil {
+					t.Fatalf("seed persisted pending marks: %v", err)
+				}
+			}
+			pendingBefore := len(w.db.GetPendingProofs())
+			if (tc.wantCompensated || tc.wantKept) && pendingBefore == 0 {
+				t.Fatal("test seeding failed: no persisted pending marks to release")
+			}
+
+			// From here on the mint is NUT-19-blind. For the recover
+			// cases (first POST landed, inputs spent) only REPLAYS are
+			// refused. For the unspent cases the refusal answers every
+			// swap POST, first and replay alike.
+			m.swapReplayRefusal = &tc.refusal
+
+			balanceBefore := w.GetBalance()
+			counter := w.counterForKeyset(m.keyset.Id)
+
+			recovered, failed, resumeErr := w.ResumePendingSwaps()
+
+			switch {
+			case tc.wantRecovered > 0:
+				if resumeErr != nil || failed != 0 || recovered != tc.wantRecovered {
+					t.Fatalf("want recover %d via ladder: recovered=%d failed=%d err=%v", tc.wantRecovered, recovered, failed, resumeErr)
+				}
+				if w.GetBalance() != balanceBefore+tc.wantRecovered {
+					t.Fatalf("balance %d, want %d", w.GetBalance(), balanceBefore+tc.wantRecovered)
+				}
+				if len(w.db.GetPendingSwaps()) != 0 {
+					t.Fatal("intent must be retired after restore recovery")
+				}
+				if m.restoreCalls != 1 {
+					t.Fatalf("restore calls = %d, want 1", m.restoreCalls)
+				}
+			case tc.wantCompensated:
+				if resumeErr != nil || failed != 0 || recovered != 0 {
+					t.Fatalf("want clean compensation: recovered=%d failed=%d err=%v", recovered, failed, resumeErr)
+				}
+				if len(w.db.GetPendingSwaps()) != 0 {
+					t.Fatal("intent must be retired on compensation")
+				}
+				if len(w.db.GetPendingProofs()) != 0 {
+					t.Fatal("pending reservation must be released on compensation")
+				}
+				if w.GetBalance() != balanceBefore {
+					t.Fatalf("balance %d must equal pre-crash %d after compensation", w.GetBalance(), balanceBefore)
+				}
+			default: // kept
+				if failed != 1 || len(w.db.GetPendingSwaps()) != 1 {
+					t.Fatalf("torn state must keep the intent: failed=%d intents=%d err=%v", failed, len(w.db.GetPendingSwaps()), resumeErr)
+				}
+			}
+			if m.checkstateCalls < 1 {
+				t.Fatal("the ladder must consult checkstate")
+			}
+			if w.counterForKeyset(m.keyset.Id) != counter {
+				t.Fatal("the ladder must never rewind the derivation counter")
+			}
+			_ = pendingBefore
+			w.Shutdown()
+		})
 	}
 }
