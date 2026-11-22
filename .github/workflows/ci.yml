@@ -32,6 +32,15 @@ jobs:
         - name: Fuzz Uint64 subtraction
           run: go test -v -fuzz=FuzzUnderflowSubUint64 -fuzztime=60s ./cashu
 
+        # The kill/restart crash-boundary harness is behind a build tag
+        # (`killtest`), so the default `go test ./...` above never compiles it.
+        # Without this step a regression in the melt reconciler's crash
+        # recovery ships green: replacing the atomic pending->used settle with
+        # the old remove-only form leaves every untagged suite passing and only
+        # this harness fails (verified by mutation).
+        - name: Kill/restart crash-boundary harness
+          run: go test ./mint/ -tags killtest -count=1 -timeout 15m
+
     mint-integration-tests:
         runs-on: ubuntu-latest
         strategy:
